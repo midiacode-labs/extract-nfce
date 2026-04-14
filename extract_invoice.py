@@ -63,7 +63,7 @@ def validate_access_key(key: str) -> bool:
     key = re.sub(r'\D', '', key)
     if len(key) != 44:
         return False
-    
+
     # Calculate Check Digit (Modulo 11)
     # Weight for multiplication: 2 to 9, right to left,
     # skipping the last digit (which is the check digit itself).
@@ -74,11 +74,12 @@ def validate_access_key(key: str) -> bool:
         weight += 1
         if weight > 9:
             weight = 2
-            
+
     remainder = total_sum % 11
     check_digit = 0 if remainder <= 1 else 11 - remainder
-    
+
     return str(check_digit) == key[-1]
+
 
 def extract_document_number(text: str):
     """Extracts CPF/CNPJ values from a text snippet."""
@@ -87,6 +88,49 @@ def extract_document_number(text: str):
         text,
     )
     return match.group() if match else None
+
+
+def extract_cnpj(text: str):
+    """Extracts only CNPJ values from a text snippet."""
+    match = re.search(r'\d{2}\.\d{3}\.\d{3}/\d{4}-\d{2}|\b\d{14}\b', text)
+    return match.group() if match else None
+
+
+def is_cnpj_document(value: str) -> bool:
+    """Returns True when the value is a Brazilian CNPJ."""
+    return len(re.sub(r'\D', '', value or '')) == 14
+
+
+def assign_detected_document(text: str, consumer_data: dict, header_data: dict) -> None:
+    """Routes OCR-detected documents to the correct JSON section."""
+    document = extract_document_number(text)
+    if not document:
+        return
+
+    upper_text = normalize_text(text).upper()
+    if "CPF" in upper_text:
+        consumer_data.setdefault("document", document)
+        return
+
+    if is_cnpj_document(document):
+        consumer_markers = [
+            "DESTINAT",
+            "RECEIVER",
+            "BUYER",
+            "CUSTOMER",
+            "CLIENTE",
+        ]
+        is_consumer_cnpj = (
+            any(marker in upper_text for marker in consumer_markers)
+            and "CONSUMIDOR FINAL" not in upper_text
+        )
+        if is_consumer_cnpj:
+            consumer_data.setdefault("document", document)
+        else:
+            header_data.setdefault("cnpj", document)
+        return
+
+    consumer_data.setdefault("document", document)
 
 
 def is_date_or_time(text: str) -> bool:
@@ -220,33 +264,33 @@ def parse_expense_data(response):
     extracted_data = {
         "header": {},
         "items": [],
-        "consumer": {}
+        "consumer": {},
     }
-    
+
     for doc in response.get('ExpenseDocuments', []):
         # 1. SummaryFields (Header and other general data)
         for field in doc.get('SummaryFields', []):
             if 'Type' not in field or 'ValueDetection' not in field:
                 continue
-                
+
             type_name = normalize_text(field['Type']['Text'])
             value = normalize_text(field['ValueDetection']['Text'])
-            
+
             # Header Mapping
             if type_name == "VENDOR_NAME":
                 extracted_data["header"]["vendor"] = value
             elif type_name == "VENDOR_VAT_NUMBER":
-                extracted_data["header"]["cnpj"] = value
+                extracted_data["header"]["cnpj"] = extract_cnpj(value) or value
             elif type_name == "VENDOR_ADDRESS" and "cnpj" not in extracted_data["header"]:
                 # Fallback in case the CNPJ appears inside the vendor address.
-                match = re.search(r'\d{2}\.\d{3}\.\d{3}/\d{4}-\d{2}', value)
-                if match:
-                    extracted_data["header"]["cnpj"] = match.group()
+                cnpj = extract_cnpj(value)
+                if cnpj:
+                    extracted_data["header"]["cnpj"] = cnpj
             elif type_name in ("INVOICE_RECEIPT_DATE", "INVOICE_DATE"):
                 set_header_issue_date(extracted_data["header"], value)
             elif type_name == "TOTAL":
                 extracted_data["header"]["total_amount"] = value
-            
+
             # Consumer Mapping
             elif type_name in ("CUSTOMER_NAME", "RECEIVER_NAME", "NAME"):
                 extracted_data["consumer"]["name"] = value
@@ -257,10 +301,16 @@ def parse_expense_data(response):
             elif any(keyword in type_name.upper() for keyword in ["ZIP", "POSTAL", "CEP"]):
                 extracted_data["consumer"]["zip_code"] = value.strip()
                 compose_consumer_address(extracted_data["consumer"])
-            elif any(keyword in type_name.upper() for keyword in ["CITY", "MUNICIPALITY"]):
+            elif any(
+                keyword in type_name.upper()
+                for keyword in ["CITY", "MUNICIPALITY"]
+            ):
                 extracted_data["consumer"]["city"] = value.strip()
                 compose_consumer_address(extracted_data["consumer"])
-            elif any(keyword in type_name.upper() for keyword in ["NEIGHBOR", "DISTRICT", "BAIRRO"]):
+            elif any(
+                keyword in type_name.upper()
+                for keyword in ["NEIGHBOR", "DISTRICT", "BAIRRO"]
+            ):
                 extracted_data["consumer"]["neighborhood"] = value.strip()
                 compose_consumer_address(extracted_data["consumer"])
             elif any(keyword in type_name.upper() for keyword in ["STATE", "PROVINCE", "UF"]):
@@ -268,7 +318,7 @@ def parse_expense_data(response):
                 compose_consumer_address(extracted_data["consumer"])
             elif "ADDRESS" in type_name.upper() and not type_name.upper().startswith("VENDOR"):
                 update_consumer_address(extracted_data["consumer"], value)
-            
+
             # Attempt to find CPF or Document via other summary field types
             elif any(
                 k in type_name.upper()
@@ -282,13 +332,19 @@ def parse_expense_data(response):
                 )
                 and type_name in ("OTHER", "CUSTOMER_NUMBER")
             ):
-                document = extract_document_number(value)
-                if document:
-                    extracted_data["consumer"]["document"] = document
+                assign_detected_document(
+                    value,
+                    extracted_data["consumer"],
+                    extracted_data["header"],
+                )
             elif type_name == "OTHER":
                 document = extract_document_number(value)
-                if document and "document" not in extracted_data["consumer"]:
-                    extracted_data["consumer"]["document"] = document
+                if document:
+                    assign_detected_document(
+                        value,
+                        extracted_data["consumer"],
+                        extracted_data["header"],
+                    )
                 elif extract_date(value) and "issue_date" not in extracted_data["header"]:
                     set_header_issue_date(extracted_data["header"], value)
                 else:
@@ -303,7 +359,7 @@ def parse_expense_data(response):
                         continue
                     item_type = normalize_text(expense_field['Type']['Text'])
                     item_val = normalize_text(expense_field['ValueDetection']['Text'])
-                    
+
                     if item_type == "ITEM":
                         item_details["description"] = item_val
                     elif item_type == "PRICE":
@@ -312,10 +368,10 @@ def parse_expense_data(response):
                         item_details["quantity"] = item_val
                     else:
                         item_details[item_type.lower()] = item_val
-                        
+
                 if item_details:
                     extracted_data["items"].append(item_details)
-                    
+
         # 3. Access Key Extraction via Text. Textract returns raw text blocks
         # This is useful when the key wasn't in structured fields and quality is compromised
         consumer_lines_to_check = 0
@@ -323,29 +379,39 @@ def parse_expense_data(response):
             if block['BlockType'] == 'LINE':
                 # Search for 44-digit key, ignoring spaces
                 text = normalize_text(block.get('Text', ''))
+                upper_text = text.upper()
                 numbers = re.sub(r'\s+', '', text)
                 if len(numbers) == 44 and numbers.isdigit():
                     extracted_data["header"]["access_key"] = numbers
                     extracted_data["header"]["is_access_key_valid"] = validate_access_key(numbers)
 
+                cnpj = extract_cnpj(text)
+                if cnpj and "cnpj" not in extracted_data["header"]:
+                    extracted_data["header"]["cnpj"] = cnpj
+
                 if "issue_date" not in extracted_data["header"] and extract_date(text):
                     set_header_issue_date(extracted_data["header"], text)
-                
+
                 # Search for consumer data in nearby text lines as OCR fallback
-                if any(k in text.upper() for k in ["DESTINATA", "CONSUMIDOR"]):
+                if any(k in upper_text for k in ["DESTINATA", "CONSUMIDOR"]):
                     consumer_lines_to_check = 15
                     continue
                 elif consumer_lines_to_check > 0:
                     document = extract_document_number(text)
-                    if document and "document" not in extracted_data["consumer"]:
-                        extracted_data["consumer"]["document"] = document
+                    if document:
+                        assign_detected_document(
+                            text,
+                            extracted_data["consumer"],
+                            extracted_data["header"],
+                        )
                     elif "name" not in extracted_data["consumer"] and is_name_candidate(text):
                         extracted_data["consumer"]["name"] = text.strip()
                     else:
                         update_consumer_address(extracted_data["consumer"], text)
                     consumer_lines_to_check -= 1
-                    
+
     return extracted_data
+
 
 @click.command()
 @click.option(

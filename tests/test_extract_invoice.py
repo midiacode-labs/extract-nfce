@@ -4,6 +4,26 @@ from extract_invoice import parse_expense_data
 
 
 class ParseExpenseDataTests(unittest.TestCase):
+    def test_extracts_issuer_cnpj_into_header_from_ocr_lines(self):
+        response = {
+            "ExpenseDocuments": [
+                {
+                    "SummaryFields": [],
+                    "LineItemGroups": [],
+                    "Blocks": [
+                        {"BlockType": "LINE", "Text": "CONSUMIDOR FINAL"},
+                        {"BlockType": "LINE", "Text": "CNPJ: 12.345.678/0001-90"},
+                        {"BlockType": "LINE", "Text": "RUA DAS FLORES, 123"},
+                    ],
+                }
+            ]
+        }
+
+        data = parse_expense_data(response)
+
+        self.assertEqual(data["header"].get("cnpj"), "12.345.678/0001-90")
+        self.assertIsNone(data["consumer"].get("document"))
+
     def test_extracts_consumer_address_from_summary_fields(self):
         response = {
             "ExpenseDocuments": [
