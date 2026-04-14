@@ -1,0 +1,28 @@
+{
+    "header": {
+        "total_amount": "2,499.00",
+        "date": "12/04/2026",
+        "issue_date": "12/04/2026"
+    },
+    "items": [
+        {
+            "product_code": "395863",
+            "description": "TV TOSHIBA SMART Trib acros R$ 551.28 Federal R$ 449.82 Estedust",
+            "other": "UN",
+            "quantity": "1.0000",
+            "unit_price": "2,499,0000",
+            "amount": "2,499.00",
+            "expense_row": "395863 TV TOSHIBA SMART B5287200 060 5929 UN 1.0000 2,499,0000 2,499.00 Trib acros R$ 551.28 Federal R$ 449.82 Estedust"
+        }
+    ],
+    "consumer": {
+        "name": "RONILDA VIEIRA PRADO OLIVEIRA",
+        "document": "030.364.455-95",
+        "zip_code": "02363-320",
+        "address": "RUA ORQUIDEA, 109, 02363-320, Sao Paulo, JARDIM FLOR DE MAIO, SP",
+        "street": "RUA ORQUIDEA, 109",
+        "state": "SP",
+        "city": "Sao Paulo",
+        "neighborhood": "JARDIM FLOR DE MAIO"
+    }
+}
