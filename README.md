@@ -1,12 +1,15 @@
-# Invoice/Receipt Extractor (NFC-e/NF-e) via CLI
+# Invoice/Receipt Extractor (NFC-e/NF-e) via CLI and Streamlit
 
-This is a Python command-line tool that uses the **Amazon Textract Analyze Expense** service to convert Brazilian invoice images (NFC-e/NF-e) into structured data in JSON format.
+This project provides both a **Python CLI** and a **Streamlit web interface** that use **Amazon Textract Analyze Expense** to convert Brazilian invoice images (NFC-e/NF-e) into structured JSON data.
 
 ## Features
 - Extraction of header data: Vendor, CNPJ, Date, Total Amount.
 - Extraction of consumer data: Name, CPF/CNPJ, and address.
 - Extraction of items (products): Description, Amount, Quantity.
 - OpenAI-based qualification step to review consumer address fields from the ZIP code and sanitize item descriptions.
+- Streamlit UI for uploading an image or capturing one directly from the device camera.
+- Side-by-side comparison between the raw extracted JSON and the qualified JSON.
+- Invoice preview with zoom control, execution timing, item counters, and reset workflow.
 - Implements a validation to avoid synchronous requests over the 10 MB AWS Textract limit.
 - Validation of the Modulo 11 check digit of the 44-digit access key, if detected in the document.
 
@@ -74,13 +77,32 @@ direnv allow
 
 ## How to Use
 
-With your credentials configured and dependencies installed, run the command-line entrypoint through the terminal:
+With your credentials configured and dependencies installed, you can choose between the web UI and the CLI.
+
+### Option 1: Run the Streamlit Web App
+
+Start the interface with:
+
+```bash
+streamlit run streamlit_app.py
+```
+
+The web app allows you to:
+- upload a JPG, JPEG, or PNG invoice image;
+- capture the invoice using the device camera;
+- preview the image with zoom;
+- run extraction first and then qualification as a second step;
+- compare the extracted and qualified JSON side by side.
+
+### Option 2: Run via CLI
+
+Use the command-line entrypoint through the terminal:
 
 ```bash
 python cli.py --input path/to/your_invoice.jpg --output result_invoice.json
 ```
 
-The command now writes two files:
+The workflow writes two files:
 - the raw extraction JSON;
 - a second qualified JSON named like `nfce_xxx_qualified.json` with corrected consumer address fields and sanitized item descriptions.
 
@@ -90,12 +112,16 @@ The command now writes two files:
 
 ## Project Structure
 - service layer: image processing, AWS communication, and response parsing live in the service module;
-- CLI entrypoint: terminal execution is handled by the CLI module.
+- qualification layer: post-processing and address/item cleanup live in the qualification service;
+- CLI entrypoint: terminal execution is handled by the CLI module;
+- Streamlit entrypoint: interactive web execution is handled by the Streamlit app.
 
 ```text
 services/
   invoice_service.py
+  invoice_qualification_service.py
 cli.py
+streamlit_app.py
 ```
 
 ### JSON Output Example
@@ -123,6 +149,13 @@ cli.py
     }
 }
 ```
+
+## Streamlit Workflow Summary
+1. Open the app in the browser.
+2. Upload an invoice image or capture one with the camera.
+3. Click **Extract invoice JSON** to generate the initial payload.
+4. Click **Qualify extracted JSON** to enrich consumer address data and sanitize item descriptions.
+5. Review both result panels and inspect the raw JSON if needed.
 
 ## Known Limitations
 - **Image Size**: Amazon Textract supports incoming images with a maximum of 10MB in synchronous calls.
