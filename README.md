@@ -53,15 +53,25 @@ export AWS_DEFAULT_REGION="us-east-1"
 
 ## How to Use
 
-With your credentials configured and dependencies installed, you can simply run the script through the terminal:
+With your credentials configured and dependencies installed, run the command-line entrypoint through the terminal:
 
 ```bash
-python extract_invoice.py --input path/to/your_invoice.jpg --output result_invoice.json
+python cli.py --input path/to/your_invoice.jpg --output result_invoice.json
 ```
 
 ### CLI Arguments
 * `--input`: Path to the image file (JPG, PNG) containing the invoice (required).
-* `--output`: Output JSON file name or path (optional, default: `result.json`).
+* `--output`: Output JSON file name or path (optional, default: file name generated inside the output folder).
+
+## Project Structure
+- service layer: image processing, AWS communication, and response parsing live in the service module;
+- CLI entrypoint: terminal execution is handled by the CLI module.
+
+```text
+services/
+  invoice_service.py
+cli.py
+```
 
 ### JSON Output Example
 ```json

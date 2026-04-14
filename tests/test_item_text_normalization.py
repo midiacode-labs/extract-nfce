@@ -1,6 +1,6 @@
 import unittest
 
-from extract_invoice import parse_expense_data
+from services.invoice_service import parse_expense_data
 
 
 class ItemTextNormalizationTests(unittest.TestCase):
