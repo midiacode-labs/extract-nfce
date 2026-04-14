@@ -8,6 +8,7 @@ except ImportError:  # Allows CLI execution even in minimal environments
     click = None
     CLICK_AVAILABLE = False
 
+from services.invoice_qualification_service import InvoiceQualificationService
 from services.invoice_service import InvoiceExtractionService
 
 
@@ -24,12 +25,22 @@ def configure_logging() -> None:
 
 
 def _run_extraction(input_file: str, output: str | None) -> None:
-    """Executes the extraction workflow and reports errors consistently."""
+    """Executes extraction and JSON qualification with consistent error handling."""
     configure_logging()
-    service = InvoiceExtractionService()
+    extraction_service = InvoiceExtractionService()
+    qualification_service = InvoiceQualificationService()
     try:
-        _, output_path = service.process_image(input_file=input_file, output=output)
-        logging.info("Success! Formatted data saved to %s", output_path)
+        extracted_data, output_path = extraction_service.process_image(
+            input_file=input_file,
+            output=output,
+        )
+        logging.info("Extracted JSON saved to %s", output_path)
+
+        _, qualified_path = qualification_service.qualify_and_save(
+            extracted_data,
+            source_output_path=output_path,
+        )
+        logging.info("Qualified JSON saved to %s", qualified_path)
     except Exception as exc:
         logging.error("%s", exc)
         raise SystemExit(1) from exc

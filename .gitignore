@@ -83,3 +83,5 @@ output/
 .python-version
 .env
 .env.*
+.envrc
+.direnv/

@@ -6,6 +6,7 @@ This is a Python command-line tool that uses the **Amazon Textract Analyze Expen
 - Extraction of header data: Vendor, CNPJ, Date, Total Amount.
 - Extraction of consumer data: Name, CPF/CNPJ, and address.
 - Extraction of items (products): Description, Amount, Quantity.
+- OpenAI-based qualification step to review consumer address fields from the ZIP code and sanitize item descriptions.
 - Implements a validation to avoid synchronous requests over the 10 MB AWS Textract limit.
 - Validation of the Modulo 11 check digit of the 44-digit access key, if detected in the document.
 
@@ -51,6 +52,26 @@ export AWS_DEFAULT_REGION="us-east-1"
 
 > **Security Warning**: Never commit your active credentials to a public or private repository!
 
+## OpenAI Setup with direnv
+
+The JSON qualification stage reads the OpenAI key from the environment.
+
+1. Install direnv and enable it in your shell.
+2. Create a local `.envrc` file in the project root:
+
+```bash
+export OPENAI_API_KEY="your_openai_api_key"
+export OPENAI_MODEL="gpt-4.1-mini"
+```
+
+3. Allow the file once:
+
+```bash
+direnv allow
+```
+
+> Keep `.envrc` local only. It is ignored by git.
+
 ## How to Use
 
 With your credentials configured and dependencies installed, run the command-line entrypoint through the terminal:
@@ -58,6 +79,10 @@ With your credentials configured and dependencies installed, run the command-lin
 ```bash
 python cli.py --input path/to/your_invoice.jpg --output result_invoice.json
 ```
+
+The command now writes two files:
+- the raw extraction JSON;
+- a second qualified JSON named like `nfce_xxx_qualified.json` with corrected consumer address fields and sanitized item descriptions.
 
 ### CLI Arguments
 * `--input`: Path to the image file (JPG, PNG) containing the invoice (required).
