@@ -364,9 +364,15 @@ def main(input_file, output):
     """
     Invoice Extractor using AWS Textract (Analyze Expense).
     """
+    project_root = os.path.dirname(os.path.abspath(__file__))
+    output_dir = os.path.join(project_root, "output")
+    os.makedirs(output_dir, exist_ok=True)
+
     if not output:
-        base_name = os.path.splitext(input_file)[0]
-        output = f"{base_name}.json"
+        base_name = os.path.splitext(os.path.basename(input_file))[0]
+        output = os.path.join(output_dir, f"{base_name}.json")
+    elif not os.path.dirname(output):
+        output = os.path.join(output_dir, output)
 
     logging.basicConfig(
         level=logging.INFO,

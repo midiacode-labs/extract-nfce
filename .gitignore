@@ -76,6 +76,9 @@ Thumbs.db
 # Logs
 *.log
 
+# Generated outputs
+output/
+
 # Local settings
 .python-version
 .env
