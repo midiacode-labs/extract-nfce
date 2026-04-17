@@ -49,6 +49,42 @@ class InvoiceExtractionService:
         return normalized.strip()
 
     @staticmethod
+    def parse_decimal(value: str) -> Optional[float]:
+        """Parses a decimal string from Textract handling US and BR formats.
+
+        Detects the format by the relative position of comma and period:
+        - ``4,198.0000`` → US format (comma = thousands) → 4198.0
+        - ``4.198,00``   → BR format (period = thousands) → 4198.0
+        - ``1,0000``     → BR format (comma = decimal)    → 1.0
+        - ``29.8000``    → US format (period = decimal)   → 29.8
+        """
+        if not value:
+            return None
+        cleaned = re.sub(r"[^\d.,]", "", str(value))
+        if not cleaned:
+            return None
+
+        last_comma = cleaned.rfind(",")
+        last_period = cleaned.rfind(".")
+
+        if last_comma >= 0 and last_period >= 0:
+            if last_comma > last_period:
+                # BR: period is thousands, comma is decimal (e.g. 4.198,00)
+                cleaned = cleaned.replace(".", "").replace(",", ".")
+            else:
+                # US: comma is thousands, period is decimal (e.g. 4,198.0000)
+                cleaned = cleaned.replace(",", "")
+        elif last_comma >= 0:
+            # Only comma: BR decimal (e.g. 1,0000)
+            cleaned = cleaned.replace(",", ".")
+        # else: only period or no separator → already fine
+
+        try:
+            return float(cleaned)
+        except ValueError:
+            return None
+
+    @staticmethod
     def extract_date(text: str) -> Optional[str]:
         """Extracts the first invoice-like date from OCR text."""
         match = re.search(r"\b\d{2}/\d{2}/\d{4}\b", text)
@@ -565,6 +601,431 @@ class InvoiceExtractionService:
 
         return item if item else None
 
+    @staticmethod
+    def _is_items_section_marker(text: str) -> bool:
+        """Returns True when the OCR line marks the items/services table."""
+        normalized = re.sub(r"\s+", " ", text).strip().upper()
+        return "DADOS DO PRODUTO" in normalized or "DADOS DOS PRODUTO" in normalized
+
+    @staticmethod
+    def _is_item_table_header_line(text: str) -> bool:
+        """Returns True for the column header row inside the items table."""
+        normalized = re.sub(r"\s+", " ", text).strip().upper()
+        header_markers = [
+            "COD. PROD",
+            "DESCRICAO DOS PRODUTOS",
+            "DESCRIÇÃO DOS PRODUTOS",
+            "NCM/SH",
+            "CFOP",
+            "UNIDADE",
+            "QTDE",
+            "V. UNITARIO",
+            "V. UNITÁRIO",
+            "V. TOTAL",
+        ]
+        return any(marker in normalized for marker in header_markers)
+
+    @staticmethod
+    def _is_item_start_line(text: str) -> bool:
+        """Returns True when the OCR line looks like the beginning of an item row."""
+        normalized = re.sub(r"\s+", " ", text).strip().upper()
+        if not normalized:
+            return False
+
+        match = re.match(r"^(\d{4,})\s+(.+)$", normalized)
+        if not match:
+            return False
+
+        remainder = match.group(2).strip()
+        if not remainder or remainder[0].isdigit():
+            return False
+
+        return bool(re.search(r"[A-Z]", remainder))
+
+    def _parse_item_line(self, text: str) -> Optional[Dict[str, Any]]:
+        """Parses a product row from raw OCR text when Textract misses line items."""
+        normalized = self.normalize_text(text)
+        if not normalized or self._is_item_table_header_line(normalized):
+            return None
+
+        full_pattern = re.compile(
+            r"^(?P<code>\d{4,})\s+"
+            r"(?P<description>.+?)\s+"
+            r"(?P<ncm>\d{4,10})\s+"
+            r"(?P<cst>\d{2,3})\s+"
+            r"(?P<cfop>\d{3,4})\s+"
+            r"(?P<unit>[A-Z]{1,5})\s+"
+            r"(?P<quantity>\d+[.,]\d+)\s+"
+            r"(?P<unit_price>\d[\d.,]*)\s+"
+            r"(?P<total_price>\d[\d.,]*)"
+        )
+        compact_pattern = re.compile(
+            r"^(?P<code>\d{4,})\s+"
+            r"(?P<description>.+?)\s+"
+            r"(?P<unit>[A-Z]{1,5})\s+"
+            r"(?P<quantity>\d+[.,]\d+)\s+"
+            r"(?P<unit_price>\d[\d.,]*)\s+"
+            r"(?P<total_price>\d[\d.,]*)"
+        )
+
+        for pattern in (full_pattern, compact_pattern):
+            match = pattern.search(normalized)
+            if not match:
+                continue
+
+            item = {
+                "code": match.group("code"),
+                "description": match.group("description").strip(" -|,;:"),
+                "unit": match.group("unit"),
+                "quantity": match.group("quantity"),
+                "unit_price": match.group("unit_price"),
+                "total_price": match.group("total_price"),
+                "expense_row": normalized,
+            }
+            if "ncm" in match.groupdict() and match.groupdict().get("ncm"):
+                item["ncm"] = match.group("ncm")
+            if "cst" in match.groupdict() and match.groupdict().get("cst"):
+                item["cst"] = match.group("cst")
+            if "cfop" in match.groupdict() and match.groupdict().get("cfop"):
+                item["cfop"] = match.group("cfop")
+            return item
+
+        return None
+
+    def _extract_items_from_blocks(self, blocks: list) -> list[Dict[str, Any]]:
+        """Builds items from OCR lines when AnalyzeExpense misses the item table."""
+        items: list[Dict[str, Any]] = []
+        inside_items_section = False
+        current_item_lines: list[str] = []
+
+        def flush_current_item() -> None:
+            if not current_item_lines:
+                return
+
+            combined_text = self.normalize_text(" ".join(current_item_lines))
+            parsed_item = self._parse_item_line(combined_text)
+            if parsed_item:
+                items.append(parsed_item)
+            current_item_lines.clear()
+
+        for block in blocks:
+            if block.get("BlockType") != "LINE":
+                continue
+
+            text = self.normalize_text(block.get("Text", ""))
+            upper_text = text.upper()
+
+            if self._is_items_section_marker(upper_text):
+                inside_items_section = True
+                continue
+
+            if not inside_items_section:
+                continue
+
+            if any(marker in upper_text for marker in ["DADOS ADICIONAIS", "RESERVADO AO FISCO", "RESERVAD"]):
+                flush_current_item()
+                break
+
+            if self._is_item_table_header_line(upper_text):
+                continue
+
+            if self._is_item_start_line(text):
+                flush_current_item()
+                current_item_lines.append(text)
+                continue
+
+            if current_item_lines:
+                current_item_lines.append(text)
+                continue
+
+            if items and any(
+                keyword in upper_text
+                for keyword in ["TRIB", "IMEI", "FEDERAL", "ESTADUAL"]
+            ):
+                items[-1]["expense_row"] = f"{items[-1].get('expense_row', '')} {text}".strip()
+
+        flush_current_item()
+        return items
+
+    # ------------------------------------------------------------------
+    # Geometry-based cell extraction (fragmented LINE blocks per cell)
+    # ------------------------------------------------------------------
+
+    _HEADER_CELL_PATTERN = re.compile(
+        r"DESCRI|UNITARI|UNITÁRIO|CFOP|QTDE|NCM|MCM"
+        r"|V\.\s*TOTAL|V\.\s*ICMS|BC\s*ICM|UNIDADE"
+        r"|PRODUTO|SERVI|COD\s*\.?\s*PROD|C[OÓ]N\s*PROD"
+        r"|COE\s*PROB|ALIQ|\bIPI\b|\bALIO\b|\bALK\b"
+        r"|\bOTDE\b|\bCIT\b|\bCROT\b|\bCROR\b",
+        re.IGNORECASE,
+    )
+
+    _INFO_CELL_KEYWORDS = ("TRIB", "FEDERAL", "ESTADUAL", "IMEI")
+
+    @staticmethod
+    def _is_data_cell_content(text: str) -> bool:
+        """Returns True when the cell text is clearly numeric item data."""
+        stripped = text.strip()
+        if re.match(r"^\d[\d.,]*$", stripped):
+            return True
+        # Short alpha tokens (UN, KG) are ambiguous with header noise;
+        # only accept 2-letter unit codes that look like real measurement units.
+        if re.match(r"^(?:UN|KG|CX|PC|LT|MT|M2|ML)$", stripped, re.IGNORECASE):
+            return True
+        return False
+
+    def _identify_item_from_cells(
+        self, cells: list[Dict[str, Any]]
+    ) -> Optional[Dict[str, Any]]:
+        """Reconstructs a single item dict from a group of fragmented cell blocks."""
+        code: Optional[str] = None
+        description_parts: list[str] = []
+        ncm: Optional[str] = None
+        cst: Optional[str] = None
+        cfop: Optional[str] = None
+        unit: Optional[str] = None
+        decimals: list[Tuple[float, str]] = []
+
+        for cell in sorted(cells, key=lambda c: c["left"]):
+            text = cell["text"].strip()
+            left = cell["left"]
+            if not text:
+                continue
+
+            stripped_digits = re.sub(r"\s", "", text)
+
+            # Decimal number (e.g. 1.0000, 999,00, 1:0000 for OCR errors)
+            cleaned = re.sub(r"[:;]", ",", text)
+            if re.match(r"^\d[\d.,]+$", cleaned) and ("." in cleaned or "," in cleaned):
+                decimals.append((left, cleaned))
+                continue
+
+            # Pure integer
+            if stripped_digits.isdigit():
+                n = len(stripped_digits)
+                if n == 8 and ncm is None:
+                    ncm = stripped_digits
+                elif 4 <= n <= 9 and code is None and left < 0.15:
+                    code = stripped_digits
+                elif 4 <= n <= 5 and cfop is None and ncm is not None:
+                    cfop = stripped_digits
+                elif 2 <= n <= 3 and cst is None and ncm is not None:
+                    cst = stripped_digits
+                continue
+
+            # Unit abbreviation (UN, KG, CX, PC, etc.)
+            if re.match(r"^(?:UN|KG|CX|PC|LT|MT|M2|ML|PÇ|PR)$", text, re.IGNORECASE):
+                unit = text.upper()
+                continue
+
+            # Description: text with letters, length > 3
+            if re.search(r"[A-Za-z]", text) and len(text) > 3:
+                description_parts.append(text)
+
+        description = " ".join(description_parts).strip() if description_parts else None
+
+        if not code and not description:
+            return None
+
+        item: Dict[str, Any] = {}
+        if code:
+            item["code"] = code
+        if description:
+            item["description"] = description
+        if ncm:
+            item["ncm"] = ncm
+        if cst:
+            item["cst"] = cst
+        if cfop:
+            item["cfop"] = cfop
+        if unit:
+            item["unit"] = unit
+
+        # Assign decimals left-to-right: quantity, unit_price, total_price
+        decimals.sort(key=lambda d: d[0])
+        if len(decimals) >= 3:
+            item["quantity"] = decimals[0][1]
+            item["unit_price"] = decimals[1][1]
+            item["total_price"] = decimals[2][1]
+        elif len(decimals) == 2:
+            item["unit_price"] = decimals[0][1]
+            item["total_price"] = decimals[1][1]
+        elif len(decimals) == 1:
+            item["total_price"] = decimals[0][1]
+
+        item["expense_row"] = self.normalize_text(
+            " ".join(c["text"] for c in sorted(cells, key=lambda c: c["left"]))
+        )
+        return item
+
+    def _extract_items_from_cell_blocks(
+        self, blocks: list
+    ) -> list[Dict[str, Any]]:
+        """Reconstructs items from fragmented per-cell LINE blocks using geometry."""
+        inside_items = False
+        cells: list[Dict[str, Any]] = []
+
+        for block in blocks:
+            if block.get("BlockType") != "LINE":
+                continue
+
+            text = self.normalize_text(block.get("Text", ""))
+            upper = text.upper()
+
+            if self._is_items_section_marker(upper):
+                inside_items = True
+                continue
+            if not inside_items:
+                continue
+            if any(m in upper for m in ["DADOS ADICIONAIS", "RESERVADO AO FISCO", "RESERVAD"]):
+                break
+
+            geo = block.get("Geometry", {}).get("BoundingBox", {})
+            top = geo.get("Top", 0)
+            left = geo.get("Left", 0)
+            if top == 0 and left == 0:
+                continue
+            cells.append({"text": text, "top": top, "left": left})
+
+        if not cells:
+            return []
+
+        # Filter header cells using keyword pattern + Y-band exclusion.
+        # Cells with data-like content (numbers, decimals, unit codes)
+        # are preserved even when they fall inside the header Y-band.
+        confirmed_header_tops = [
+            c["top"] for c in cells if self._HEADER_CELL_PATTERN.search(c["text"])
+        ]
+
+        if confirmed_header_tops:
+            h_min = min(confirmed_header_tops) - 0.003
+            h_max = max(confirmed_header_tops) + 0.003
+            data_cells = [
+                c for c in cells
+                if (
+                    not (h_min <= c["top"] <= h_max)
+                    or self._is_data_cell_content(c["text"])
+                )
+                and not self._HEADER_CELL_PATTERN.search(c["text"])
+            ]
+        else:
+            data_cells = [
+                c for c in cells
+                if not self._HEADER_CELL_PATTERN.search(c["text"])
+            ]
+
+        # Separate tax/info cells (keep their Y for per-item assignment)
+        info_cells: list[Dict[str, Any]] = []
+        clean_cells: list[Dict[str, Any]] = []
+        for c in data_cells:
+            if any(kw in c["text"].upper() for kw in self._INFO_CELL_KEYWORDS):
+                info_cells.append(c)
+            else:
+                clean_cells.append(c)
+
+        if not clean_cells:
+            return []
+
+        # Find product code cells (standalone digits at leftmost column)
+        code_cells = [
+            c for c in clean_cells
+            if re.match(r"^\d{4,9}$", c["text"].strip()) and c["left"] < 0.15
+        ]
+
+        items: list[Dict[str, Any]] = []
+
+        if not code_cells:
+            item = self._identify_item_from_cells(clean_cells)
+            if item:
+                if info_cells:
+                    item["expense_row"] = (
+                        f"{item.get('expense_row', '')} "
+                        f"{' '.join(c['text'] for c in info_cells)}"
+                    ).strip()
+                items.append(item)
+            return items
+
+        code_cells.sort(key=lambda c: c["top"])
+
+        # Partition all non-code data cells into per-item groups.
+        # Between consecutive code cells, find the largest Y-gap among
+        # the interleaved data cells and split there.
+        all_non_code = [c for c in clean_cells + info_cells if c not in code_cells]
+        all_non_code.sort(key=lambda c: c["top"])
+
+        boundaries = self._compute_item_boundaries(code_cells, all_non_code)
+
+        for idx, cc in enumerate(code_cells):
+            y_min, y_max = boundaries[idx]
+
+            item_cells = [c for c in clean_cells if y_min <= c["top"] <= y_max]
+            item = self._identify_item_from_cells(item_cells)
+            if item:
+                item_info = [c for c in info_cells if y_min <= c["top"] <= y_max + 0.01]
+                if item_info:
+                    item["expense_row"] = (
+                        f"{item.get('expense_row', '')} "
+                        f"{' '.join(c['text'] for c in item_info)}"
+                    ).strip()
+                items.append(item)
+
+        return items
+
+    @staticmethod
+    def _compute_item_boundaries(
+        code_cells: list[Dict[str, Any]],
+        non_code_cells: list[Dict[str, Any]],
+    ) -> list[Tuple[float, float]]:
+        """Computes (y_min, y_max) for each code cell using gap analysis."""
+        boundaries: list[Tuple[float, float]] = []
+
+        for idx, cc in enumerate(code_cells):
+            # Default generous bounds
+            y_min = cc["top"] - 0.025
+            y_max = cc["top"] + 0.03
+
+            if idx > 0:
+                prev_code = code_cells[idx - 1]
+                # Find the largest Y-gap between consecutive cells in
+                # the range between two code cells to split items there.
+                between = sorted(
+                    [c for c in non_code_cells if prev_code["top"] < c["top"] < cc["top"]],
+                    key=lambda c: c["top"],
+                )
+                if len(between) >= 2:
+                    max_gap = 0
+                    split_y = (prev_code["top"] + cc["top"]) / 2
+                    for i in range(1, len(between)):
+                        gap = between[i]["top"] - between[i - 1]["top"]
+                        if gap > max_gap:
+                            max_gap = gap
+                            split_y = (between[i - 1]["top"] + between[i]["top"]) / 2
+                    y_min = split_y
+                else:
+                    y_min = (prev_code["top"] + cc["top"]) / 2
+
+            if idx + 1 < len(code_cells):
+                next_code = code_cells[idx + 1]
+                between = sorted(
+                    [c for c in non_code_cells if cc["top"] < c["top"] < next_code["top"]],
+                    key=lambda c: c["top"],
+                )
+                if len(between) >= 2:
+                    max_gap = 0
+                    split_y = (cc["top"] + next_code["top"]) / 2
+                    for i in range(1, len(between)):
+                        gap = between[i]["top"] - between[i - 1]["top"]
+                        if gap > max_gap:
+                            max_gap = gap
+                            split_y = (between[i - 1]["top"] + between[i]["top"]) / 2
+                    y_max = split_y
+                else:
+                    y_max = (cc["top"] + next_code["top"]) / 2
+
+            boundaries.append((y_min, y_max))
+
+        return boundaries
+
     def _extract_from_blocks(
         self, blocks: list, data: Dict[str, Any]
     ) -> None:
@@ -798,6 +1259,12 @@ class InvoiceExtractionService:
                     item = self._extract_item(line_item)
                     if item:
                         data["items"].append(item)
+
+            if not data["items"]:
+                data["items"] = self._extract_items_from_blocks(doc.get("Blocks", []))
+
+            if not data["items"]:
+                data["items"] = self._extract_items_from_cell_blocks(doc.get("Blocks", []))
 
             self._extract_from_blocks(doc.get("Blocks", []), data)
 

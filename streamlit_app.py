@@ -195,15 +195,8 @@ def format_brl_currency(value: Any) -> str:
     if not text:
         return "—"
 
-    cleaned = text.replace("R$", "").replace(" ", "")
-    if "," in cleaned and "." in cleaned:
-        cleaned = cleaned.replace(".", "").replace(",", ".")
-    elif "," in cleaned:
-        cleaned = cleaned.replace(",", ".")
-
-    try:
-        number = float(cleaned)
-    except ValueError:
+    number = InvoiceExtractionService.parse_decimal(text.replace("R$", "").strip())
+    if number is None:
         return html.escape(text)
 
     formatted = f"R$ {number:,.2f}"

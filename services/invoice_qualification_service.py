@@ -82,8 +82,36 @@ class InvoiceQualificationService:
             description = item.get("description")
             if description:
                 item["description"] = self.sanitize_item_description(description)
+            self.fix_item_total_price(item)
 
         return qualified_data
+
+    @staticmethod
+    def _parse_br_decimal(value: str) -> Optional[float]:
+        """Parses a decimal string handling both US and BR formats."""
+        return InvoiceExtractionService.parse_decimal(value)
+
+    @classmethod
+    def fix_item_total_price(cls, item: Dict[str, Any]) -> None:
+        """Recalculates total_price when unit_price * quantity diverges from it."""
+        unit_price = cls._parse_br_decimal(item.get("unit_price", ""))
+        quantity = cls._parse_br_decimal(item.get("quantity", ""))
+        total_price = cls._parse_br_decimal(item.get("total_price", ""))
+
+        if unit_price is None or quantity is None:
+            return
+
+        expected = round(unit_price * quantity, 2)
+
+        if total_price is not None and abs(total_price - expected) < 0.01:
+            return
+
+        # Format with the same decimal separator used in the original value
+        original = item.get("total_price", "")
+        if "," in original and "." not in original:
+            item["total_price"] = f"{expected:,.2f}".replace(",", "X").replace(".", ",").replace("X", ".")
+        else:
+            item["total_price"] = f"{expected:.2f}"
 
     def build_messages(self, extracted_data: Dict[str, Any]) -> List[Dict[str, Any]]:
         """Builds the prompt sent to the OpenAI Responses API."""

@@ -90,6 +90,64 @@ class InvoiceQualificationServiceTests(unittest.TestCase):
             self.assertTrue(os.path.exists(qualified_path))
             self.assertEqual(qualified_data["items"][0]["description"], "ARROZ")
 
+    def test_fix_item_total_price_recalculates_when_wrong(self):
+        service = InvoiceQualificationService(api_key=None, client=None)
+        extracted_data = {
+            "consumer": {},
+            "items": [
+                {
+                    "description": "SECADOR DE CABELO",
+                    "quantity": "1,0000",
+                    "unit_price": "139.0000",
+                    "total_price": "130.00",
+                },
+                {
+                    "description": "PRANCHA TITANIUM",
+                    "quantity": "2,0000",
+                    "unit_price": "119.0000",
+                    "total_price": "238.00",
+                },
+            ],
+        }
+        qualified = service.apply_local_fixes(extracted_data)
+
+        self.assertEqual(qualified["items"][0]["total_price"], "139.00")
+        # Item 2 already matches (2 * 119 = 238), should remain unchanged
+        self.assertEqual(qualified["items"][1]["total_price"], "238.00")
+
+    def test_fix_item_total_price_preserves_brazilian_format(self):
+        service = InvoiceQualificationService(api_key=None, client=None)
+        extracted_data = {
+            "consumer": {},
+            "items": [
+                {
+                    "description": "CAFE 500G",
+                    "quantity": "3",
+                    "unit_price": "12,90",
+                    "total_price": "35,70",
+                },
+            ],
+        }
+        qualified = service.apply_local_fixes(extracted_data)
+
+        self.assertEqual(qualified["items"][0]["total_price"], "38,70")
+
+    def test_fix_item_total_price_skips_when_fields_missing(self):
+        service = InvoiceQualificationService(api_key=None, client=None)
+        extracted_data = {
+            "consumer": {},
+            "items": [
+                {
+                    "description": "ARROZ",
+                    "total_price": "9,99",
+                },
+            ],
+        }
+        qualified = service.apply_local_fixes(extracted_data)
+
+        # No unit_price/quantity, so total_price stays as-is
+        self.assertEqual(qualified["items"][0]["total_price"], "9,99")
+
 
 if __name__ == "__main__":
     unittest.main()
