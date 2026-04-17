@@ -7,18 +7,26 @@ from services.invoice_qualification_service import InvoiceQualificationService
 
 
 class _FakeResponses:
-    def __init__(self, payload):
+    def __init__(self, payload, usage=None):
         self.payload = payload
+        self.usage = usage
         self.calls = []
 
     def create(self, **kwargs):
         self.calls.append(kwargs)
-        return type("OpenAIResponse", (), {"output_text": json.dumps(self.payload)})()
+        usage = None
+        if self.usage is not None:
+            usage = type("Usage", (), self.usage)()
+        return type(
+            "OpenAIResponse",
+            (),
+            {"output_text": json.dumps(self.payload), "usage": usage},
+        )()
 
 
 class _FakeClient:
-    def __init__(self, payload):
-        self.responses = _FakeResponses(payload)
+    def __init__(self, payload, usage=None):
+        self.responses = _FakeResponses(payload, usage=usage)
 
 
 class InvoiceQualificationServiceTests(unittest.TestCase):
@@ -52,7 +60,10 @@ class InvoiceQualificationServiceTests(unittest.TestCase):
             "items": [{"description": "CAFE 500G"}],
         }
 
-        fake_client = _FakeClient(qualified_payload)
+        fake_client = _FakeClient(
+            qualified_payload,
+            usage={"input_tokens": 320, "output_tokens": 90, "total_tokens": 410},
+        )
         service = InvoiceQualificationService(api_key="test-key", client=fake_client)
 
         qualified_data = service.qualify_data(extracted_data)
@@ -62,6 +73,7 @@ class InvoiceQualificationServiceTests(unittest.TestCase):
         self.assertEqual(qualified_data["items"][0]["description"], "CAFE 500G")
         self.assertEqual(qualified_data["items"][0]["total_price"], "12,90")
         self.assertEqual(len(fake_client.responses.calls), 1)
+        self.assertEqual(service.get_last_usage()["total_tokens"], 410)
 
     def test_qualify_file_writes_a_new_qualified_json(self):
         extracted_data = {
@@ -89,6 +101,26 @@ class InvoiceQualificationServiceTests(unittest.TestCase):
             self.assertTrue(qualified_path.endswith("nfce_001_qualified.json"))
             self.assertTrue(os.path.exists(qualified_path))
             self.assertEqual(qualified_data["items"][0]["description"], "ARROZ")
+
+    def test_save_qualified_snapshot_uses_standard_suffix(self):
+        extracted_data = {
+            "consumer": {"name": "JOAO"},
+            "items": [{"description": "CAFE"}],
+        }
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            source_output_path = os.path.join(tmpdir, "nfce_001.json")
+            with open(source_output_path, "w", encoding="utf-8") as file_handle:
+                json.dump(extracted_data, file_handle)
+
+            qualified_data, qualified_path = InvoiceQualificationService.save_qualified_snapshot(
+                extracted_data,
+                source_output_path=source_output_path,
+            )
+
+            self.assertEqual(qualified_data, extracted_data)
+            self.assertTrue(qualified_path.endswith("nfce_001_qualified.json"))
+            self.assertTrue(os.path.exists(qualified_path))
 
     def test_fix_prices_leaves_conflicting_values_unchanged(self):
         """When both unit_price and total_price exist but disagree, neither
@@ -180,6 +212,13 @@ class InvoiceQualificationServiceTests(unittest.TestCase):
 
         # No unit_price/quantity, so prices stay as-is
         self.assertEqual(qualified["items"][0]["total_price"], "9,99")
+
+    def test_sanitize_item_description_removes_residual_fiscal_noise(self):
+        cleaned = InvoiceQualificationService.sanitize_item_description(
+            "TV 65 SAMSUNG UN65BU7350WXZD Tp de apre. R 9,10 / R 60,03 Refapefun."
+        )
+
+        self.assertEqual(cleaned, "TV 65 SAMSUNG UN65BU7350WXZD")
 
 
 if __name__ == "__main__":

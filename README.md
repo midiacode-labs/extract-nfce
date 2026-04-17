@@ -1,14 +1,16 @@
 # Invoice/Receipt Extractor (NFC-e/NF-e) via CLI and Streamlit
 
-This project provides both a **Python CLI** and a **Streamlit web interface** that use **Amazon Textract Analyze Expense** to convert Brazilian invoice images (NFC-e/NF-e) into structured JSON data.
+This project provides both a **Python CLI** and a **Streamlit web interface** to convert Brazilian invoice images (NFC-e/NF-e) into structured JSON data using either **Amazon Textract Analyze Expense** or an **OpenAI-only image extraction flow**.
 
 ## Features
 - Extraction of header data: Vendor, CNPJ, Date, Total Amount.
 - Extraction of consumer data: Name, CPF/CNPJ, and address.
 - Extraction of items (products): Description, Amount, Quantity.
 - OpenAI-based qualification step to review consumer address fields from the ZIP code and sanitize item descriptions.
+- OpenAI-only extraction mode that sends the image directly to the OpenAI API and returns the full invoice structure without AWS Textract.
 - Streamlit UI for uploading an image or capturing one directly from the device camera.
-- Side-by-side comparison between the raw extracted JSON and the qualified JSON.
+- Selection of extraction backend in both Streamlit and CLI.
+- Estimated AWS Textract and OpenAI cost reporting in the UI, with a 37% surcharge applied.
 - Invoice preview with zoom control, execution timing, item counters, and reset workflow.
 - Implements a validation to avoid synchronous requests over the 10 MB AWS Textract limit.
 - Validation of the Modulo 11 check digit of the 44-digit access key, if detected in the document.
@@ -57,7 +59,7 @@ export AWS_DEFAULT_REGION="us-east-1"
 
 ## OpenAI Setup with direnv
 
-The JSON qualification stage reads the OpenAI key from the environment.
+The JSON qualification stage and the OpenAI-only extraction flow read the OpenAI key from the environment.
 
 1. Install direnv and enable it in your shell.
 2. Create a local `.envrc` file in the project root:
@@ -65,6 +67,7 @@ The JSON qualification stage reads the OpenAI key from the environment.
 ```bash
 export OPENAI_API_KEY="your_openai_api_key"
 export OPENAI_MODEL="gpt-4.1-mini"
+export OPENAI_EXTRACTION_MODEL="gpt-4.1-mini"
 ```
 
 3. Allow the file once:
@@ -90,16 +93,20 @@ streamlit run streamlit_app.py
 The web app allows you to:
 - upload a JPG, JPEG, or PNG invoice image;
 - capture the invoice using the device camera;
+- choose between `AWS Textract + OpenAI` and `OpenAI somente`;
 - preview the image with zoom;
-- run extraction first and then qualification as a second step;
-- compare the extracted and qualified JSON side by side.
+- process the invoice end-to-end automatically after upload;
+- review estimated AWS Textract cost, estimated OpenAI cost, and total estimated cost;
+- review OpenAI token usage whenever the selected flow includes OpenAI.
 
 ### Option 2: Run via CLI
 
 Use the command-line entrypoint through the terminal:
 
 ```bash
-python cli.py --input path/to/your_invoice.jpg --output result_invoice.json
+python cli.py --input path/to/your_invoice.jpg --output result_invoice.json --method textract
+
+python cli.py --input path/to/your_invoice.jpg --output result_invoice.json --method openai
 ```
 
 The workflow writes two files:
@@ -109,10 +116,12 @@ The workflow writes two files:
 ### CLI Arguments
 * `--input`: Path to the image file (JPG, PNG) containing the invoice (required).
 * `--output`: Output JSON file name or path (optional, default: file name generated inside the output folder).
+* `--method`: Extraction backend. Use `textract` for AWS Textract plus OpenAI qualification, or `openai` for the OpenAI-only image extraction flow.
 
 ## Project Structure
 - service layer: image processing, AWS communication, and response parsing live in the service module;
 - qualification layer: post-processing and address/item cleanup live in the qualification service;
+- OpenAI-only extraction layer: direct image-to-JSON extraction lives in a dedicated service;
 - CLI entrypoint: terminal execution is handled by the CLI module;
 - Streamlit entrypoint: interactive web execution is handled by the Streamlit app.
 
@@ -120,6 +129,7 @@ The workflow writes two files:
 services/
   invoice_service.py
   invoice_qualification_service.py
+    openai_invoice_service.py
 cli.py
 streamlit_app.py
 ```
@@ -152,10 +162,10 @@ streamlit_app.py
 
 ## Streamlit Workflow Summary
 1. Open the app in the browser.
-2. Upload an invoice image or capture one with the camera.
-3. Click **Extract invoice JSON** to generate the initial payload.
-4. Click **Qualify extracted JSON** to enrich consumer address data and sanitize item descriptions.
-5. Review both result panels and inspect the raw JSON if needed.
+2. Choose the extraction backend.
+3. Upload an invoice image or capture one with the camera.
+4. Wait for the selected workflow to finish automatically.
+5. Review the qualified result, token usage, and estimated OpenAI cost when available.
 
 ## Known Limitations
 - **Image Size**: Amazon Textract supports incoming images with a maximum of 10MB in synchronous calls.

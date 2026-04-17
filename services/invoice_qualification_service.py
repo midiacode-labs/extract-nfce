@@ -9,6 +9,11 @@ try:
 except ImportError:  # Allows local fallback when the SDK is not installed
     OpenAI = None
 
+from services.openai_response_utils import (
+    build_usage_summary,
+    extract_response_text,
+    parse_json_response,
+)
 from services.invoice_service import InvoiceExtractionService
 
 
@@ -26,6 +31,7 @@ class InvoiceQualificationService:
         self.api_key = api_key or os.environ.get("OPENAI_API_KEY")
         self.model = model or os.environ.get("OPENAI_MODEL", self.DEFAULT_MODEL)
         self.client = client if client is not None else self._create_client()
+        self.last_usage: Optional[Dict[str, Any]] = None
 
     def _create_client(self) -> Any:
         """Creates the OpenAI client when the SDK and API key are available."""
@@ -52,10 +58,14 @@ class InvoiceQualificationService:
             r"(?i)\bvalor\s+aprox(?:imado)?\s+dos\s+tributos\b.*$",
             r"(?i)\b(?:imposto(?:s)?|icms|ipi|pis|cofins)\b.*$",
             r"(?i)\b(?:federal|estadual|municipal)\b.*$",
+            r"(?i)\btp\s+de\s+apre\.?\b.*$",
+            r"(?i)\btipo\s+de\s+apre(?:c|ci|cia|ciac)[a-z.]*\b.*$",
+            r"(?i)\brefap\w*\b.*$",
         ]
         for pattern in removal_patterns:
             cleaned = re.sub(pattern, "", cleaned).strip(" -|,;:")
 
+        cleaned = re.sub(r"(?i)\s+[R$]?\s*\d[\d.,]*(?:\s*/\s*[R$]?\s*\d[\d.,]*)+$", "", cleaned)
         cleaned = re.sub(r"\s+", " ", cleaned).strip(" -|,;:")
         return cleaned or InvoiceExtractionService.normalize_text(value)
 
@@ -113,14 +123,18 @@ class InvoiceQualificationService:
         if total_price is None and unit_price is not None:
             computed = round(unit_price * quantity, 2)
             if uses_br_format:
-                item["total_price"] = f"{computed:,.2f}".replace(",", "X").replace(".", ",").replace("X", ".")
+                item["total_price"] = (
+                    f"{computed:,.2f}".replace(",", "X").replace(".", ",").replace("X", ".")
+                )
             else:
                 item["total_price"] = f"{computed:.2f}"
 
         elif unit_price is None and total_price is not None:
             computed = round(total_price / quantity, 4)
             if uses_br_format:
-                item["unit_price"] = f"{computed:,.4f}".replace(",", "X").replace(".", ",").replace("X", ".")
+                item["unit_price"] = (
+                    f"{computed:,.4f}".replace(",", "X").replace(".", ",").replace("X", ".")
+                )
             else:
                 item["unit_price"] = f"{computed:.4f}"
 
@@ -148,36 +162,9 @@ class InvoiceQualificationService:
             },
         ]
 
-    @staticmethod
-    def extract_response_text(response: Any) -> str:
-        """Extracts plain text from an OpenAI response object."""
-        if hasattr(response, "output_text") and response.output_text:
-            return response.output_text
-
-        output = getattr(response, "output", None) or []
-        for item in output:
-            content = getattr(item, "content", None) or []
-            for entry in content:
-                text_value = getattr(entry, "text", None)
-                if text_value:
-                    return text_value
-
-        raise RuntimeError("The OpenAI response did not contain a text payload.")
-
-    @staticmethod
-    def parse_json_response(text: str) -> Dict[str, Any]:
-        """Parses a JSON object that may arrive wrapped in Markdown fences."""
-        cleaned = text.strip()
-        cleaned = re.sub(r"^```(?:json)?\s*", "", cleaned)
-        cleaned = re.sub(r"\s*```$", "", cleaned)
-
-        try:
-            return json.loads(cleaned)
-        except json.JSONDecodeError:
-            match = re.search(r"\{.*\}", cleaned, flags=re.DOTALL)
-            if not match:
-                raise
-            return json.loads(match.group(0))
+    def get_last_usage(self) -> Optional[Dict[str, Any]]:
+        """Returns the token usage summary from the last qualification call."""
+        return self.last_usage
 
     def merge_qualified_data(
         self,
@@ -225,6 +212,7 @@ class InvoiceQualificationService:
     def qualify_data(self, extracted_data: Dict[str, Any]) -> Dict[str, Any]:
         """Qualifies extracted JSON with OpenAI and falls back to local normalization."""
         locally_qualified = self.apply_local_fixes(extracted_data)
+        self.last_usage = None
         if self.client is None:
             return locally_qualified
 
@@ -233,8 +221,9 @@ class InvoiceQualificationService:
                 model=self.model,
                 input=self.build_messages(locally_qualified),
             )
-            response_text = self.extract_response_text(response)
-            qualified_fragment = self.parse_json_response(response_text)
+            self.last_usage = build_usage_summary(response, self.model)
+            response_text = extract_response_text(response)
+            qualified_fragment = parse_json_response(response_text)
             return self.merge_qualified_data(locally_qualified, qualified_fragment)
         except Exception as exc:
             logging.warning(
@@ -269,6 +258,21 @@ class InvoiceQualificationService:
         with open(qualified_output_path, "w", encoding="utf-8") as file_handle:
             json.dump(qualified_data, file_handle, indent=4, ensure_ascii=False)
         return qualified_data, qualified_output_path
+
+    @staticmethod
+    def save_qualified_snapshot(
+        extracted_data: Dict[str, Any],
+        source_output_path: str,
+        output: Optional[str] = None,
+    ) -> Tuple[Dict[str, Any], str]:
+        """Persists an already-qualified payload using the standard _qualified path."""
+        qualified_output_path = InvoiceQualificationService.resolve_output_path(
+            source_output_path,
+            output=output,
+        )
+        with open(qualified_output_path, "w", encoding="utf-8") as file_handle:
+            json.dump(extracted_data, file_handle, indent=4, ensure_ascii=False)
+        return extracted_data, qualified_output_path
 
     def qualify_file(
         self,

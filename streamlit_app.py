@@ -11,12 +11,14 @@ from typing import Any, Dict
 import streamlit as st
 
 from services.invoice_qualification_service import InvoiceQualificationService
+from services.openai_invoice_service import OpenAIInvoiceExtractionService
 from services.invoice_service import InvoiceExtractionService
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 
 STATE_DEFAULTS: Dict[str, Any] = {
     "input_mode": "upload",
+    "extraction_method": "textract",
     "image_bytes": None,
     "image_name": None,
     "image_mime": "image/jpeg",
@@ -29,7 +31,16 @@ STATE_DEFAULTS: Dict[str, Any] = {
     "qualified_output_path": None,
     "qualification_duration": None,
     "workflow_duration": None,
+    "extraction_usage": None,
+    "qualification_usage": None,
+    "workflow_usage": None,
+    "last_processed_method": None,
     "widget_nonce": 0,
+}
+
+EXTRACTION_METHOD_LABELS = {
+    "textract": "AWS Textract + OpenAI",
+    "openai": "OpenAI somente",
 }
 
 
@@ -62,6 +73,81 @@ def format_duration(seconds: float) -> str:
     hours = minutes // 60
     remaining_minutes = minutes % 60
     return f"{hours} h {remaining_minutes} min"
+
+
+def format_token_count(value: Any) -> str:
+    """Formats token counters for display in metrics."""
+    if value in (None, ""):
+        return "—"
+    return f"{int(value):,}".replace(",", ".")
+
+
+def format_usd_cost(value: Any) -> str:
+    """Formats estimated USD cost values for display."""
+    if value in (None, ""):
+        return "—"
+    return f"US$ {float(value):.6f}"
+
+
+def format_page_count(value: Any) -> str:
+    """Formats page counters for display."""
+    if value in (None, ""):
+        return "—"
+    return str(int(value))
+
+
+def combine_usage_summaries(*summaries: Dict[str, Any] | None) -> Dict[str, Any] | None:
+    """Combines provider usage summaries into a workflow total."""
+    available = [summary for summary in summaries if summary]
+    if not available:
+        return None
+
+    openai_summaries = [
+        summary for summary in available if summary.get("provider") == "openai"
+    ]
+    aws_summaries = [
+        summary for summary in available if summary.get("provider") == "aws_textract"
+    ]
+
+    return {
+        "components": available,
+        "model": ", ".join(
+            summary.get("model", "") for summary in openai_summaries if summary.get("model")
+        ),
+        "input_tokens": (
+            sum(int(summary.get("input_tokens") or 0) for summary in openai_summaries)
+            if openai_summaries
+            else None
+        ),
+        "output_tokens": (
+            sum(int(summary.get("output_tokens") or 0) for summary in openai_summaries)
+            if openai_summaries
+            else None
+        ),
+        "total_tokens": (
+            sum(int(summary.get("total_tokens") or 0) for summary in openai_summaries)
+            if openai_summaries
+            else None
+        ),
+        "openai_estimated_cost_usd": (
+            sum(float(summary.get("estimated_cost_usd") or 0.0) for summary in openai_summaries)
+            if openai_summaries
+            else None
+        ),
+        "aws_textract_page_count": (
+            sum(int(summary.get("page_count") or 0) for summary in aws_summaries)
+            if aws_summaries
+            else None
+        ),
+        "aws_textract_estimated_cost_usd": (
+            sum(float(summary.get("estimated_cost_usd") or 0.0) for summary in aws_summaries)
+            if aws_summaries
+            else None
+        ),
+        "total_estimated_cost_usd": sum(
+            float(summary.get("estimated_cost_usd") or 0.0) for summary in available
+        ),
+    }
 
 
 def persist_uploaded_file(uploaded_file) -> str:
@@ -101,7 +187,18 @@ def set_selected_image(uploaded_file) -> bool:
     st.session_state["qualified_output_path"] = None
     st.session_state["qualification_duration"] = None
     st.session_state["workflow_duration"] = None
+    st.session_state["extraction_usage"] = None
+    st.session_state["qualification_usage"] = None
+    st.session_state["workflow_usage"] = None
+    st.session_state["last_processed_method"] = None
     return True
+
+
+def build_extraction_service(method: str):
+    """Builds the extraction backend selected in the UI."""
+    if method == "openai":
+        return OpenAIInvoiceExtractionService()
+    return InvoiceExtractionService()
 
 
 def run_extraction() -> None:
@@ -111,7 +208,7 @@ def run_extraction() -> None:
         st.warning("Envie ou capture uma imagem da nota fiscal primeiro.")
         return
 
-    service = InvoiceExtractionService()
+    service = build_extraction_service(st.session_state.get("extraction_method", "textract"))
     started_at = time.perf_counter()
     extracted_data, output_path = service.process_image(input_file=input_path)
     elapsed = time.perf_counter() - started_at
@@ -119,6 +216,7 @@ def run_extraction() -> None:
     st.session_state["extracted_data"] = extracted_data
     st.session_state["extracted_output_path"] = output_path
     st.session_state["extraction_duration"] = elapsed
+    st.session_state["extraction_usage"] = getattr(service, "get_last_usage", lambda: None)()
 
 
 def run_qualification() -> None:
@@ -129,12 +227,20 @@ def run_qualification() -> None:
         st.warning("Execute a etapa de extração antes de qualificar o JSON.")
         return
 
-    service = InvoiceQualificationService()
     started_at = time.perf_counter()
-    qualified_data, qualified_output_path = service.qualify_and_save(
-        extracted_data,
-        source_output_path=output_path,
-    )
+    if st.session_state.get("extraction_method") == "openai":
+        qualified_data, qualified_output_path = InvoiceQualificationService.save_qualified_snapshot(
+            extracted_data,
+            source_output_path=output_path,
+        )
+        st.session_state["qualification_usage"] = None
+    else:
+        service = InvoiceQualificationService()
+        qualified_data, qualified_output_path = service.qualify_and_save(
+            extracted_data,
+            source_output_path=output_path,
+        )
+        st.session_state["qualification_usage"] = service.get_last_usage()
     elapsed = time.perf_counter() - started_at
 
     st.session_state["qualified_data"] = qualified_data
@@ -148,6 +254,11 @@ def run_full_workflow() -> None:
     run_extraction()
     run_qualification()
     st.session_state["workflow_duration"] = time.perf_counter() - started_at
+    st.session_state["workflow_usage"] = combine_usage_summaries(
+        st.session_state.get("extraction_usage"),
+        st.session_state.get("qualification_usage"),
+    )
+    st.session_state["last_processed_method"] = st.session_state.get("extraction_method")
 
 
 def render_image_preview() -> None:
@@ -272,6 +383,8 @@ def render_result_panel(
     duration: float | None,
     output_path: str | None,
     empty_message: str,
+    usage_summary: Dict[str, Any] | None = None,
+    method_label: str | None = None,
 ) -> None:
     """Displays a result block with friendly sections and optional raw JSON."""
     st.subheader(title)
@@ -281,6 +394,8 @@ def render_result_panel(
 
     if duration is not None:
         st.success(f"Concluído em {format_duration(duration)}.")
+    if method_label:
+        st.caption(f"Método: {method_label}")
 
     summary_column_1, summary_column_2 = st.columns(2)
     with summary_column_1:
@@ -288,6 +403,37 @@ def render_result_panel(
     with summary_column_2:
         consumer_name = data.get("consumer", {}).get("name") or "Não informado"
         st.metric("Consumidor", consumer_name)
+
+    if usage_summary:
+        st.caption("Custos estimados com adicional de 37%.")
+
+        cost_column_1, cost_column_2, cost_column_3 = st.columns(3)
+        with cost_column_1:
+            st.metric(
+                "Custo estimado AWS Textract",
+                format_usd_cost(usage_summary.get("aws_textract_estimated_cost_usd")),
+            )
+        with cost_column_2:
+            st.metric(
+                "Custo estimado OpenAI",
+                format_usd_cost(usage_summary.get("openai_estimated_cost_usd")),
+            )
+        with cost_column_3:
+            st.metric(
+                "Custo estimado total",
+                format_usd_cost(usage_summary.get("total_estimated_cost_usd")),
+            )
+
+        detail_column_1, detail_column_2, detail_column_3 = st.columns(3)
+        with detail_column_1:
+            st.metric(
+                "Páginas Textract",
+                format_page_count(usage_summary.get("aws_textract_page_count")),
+            )
+        with detail_column_2:
+            st.metric("Input tokens", format_token_count(usage_summary.get("input_tokens")))
+        with detail_column_3:
+            st.metric("Output tokens", format_token_count(usage_summary.get("output_tokens")))
 
     render_info_table("Emitente", data.get("emitter", {}))
     render_info_table("Identificação", data.get("identification", {}))
@@ -315,6 +461,11 @@ def render_qualified_result() -> None:
         duration=st.session_state.get("workflow_duration"),
         output_path=st.session_state.get("qualified_output_path"),
         empty_message="O resultado qualificado aparecerá aqui após o processamento da imagem.",
+        usage_summary=st.session_state.get("workflow_usage"),
+        method_label=EXTRACTION_METHOD_LABELS.get(
+            st.session_state.get("extraction_method", "textract"),
+            st.session_state.get("extraction_method", "textract"),
+        ),
     )
 
 
@@ -325,7 +476,8 @@ def main() -> None:
 
     st.title("🧾 Extrator de Notas Fiscais")
     st.write(
-        "Siga os passos abaixo para enviar uma imagem da nota fiscal e revisar os dados qualificados."
+        "Siga os passos abaixo para enviar uma imagem da nota fiscal "
+        "e revisar os dados qualificados."
     )
     nonce = st.session_state.get("widget_nonce", 0)
 
@@ -338,7 +490,16 @@ def main() -> None:
         horizontal=True,
     )
 
-    st.markdown("### Passo 2. Envie a imagem")
+    st.markdown("### Passo 2. Escolha o método de extração")
+    st.radio(
+        "Qual fluxo deve ser usado para extrair a nota fiscal?",
+        options=["textract", "openai"],
+        format_func=lambda option: EXTRACTION_METHOD_LABELS.get(option, option),
+        key="extraction_method",
+        horizontal=True,
+    )
+
+    st.markdown("### Passo 3. Envie a imagem")
     selected_file = None
     if st.session_state.get("input_mode") == "upload":
         selected_file = st.file_uploader(
@@ -356,24 +517,34 @@ def main() -> None:
         st.info("Escolha um método de envio e envie a imagem da nota fiscal para continuar.")
 
     try:
-        if set_selected_image(selected_file):
+        should_run = set_selected_image(selected_file)
+        if (
+            not should_run
+            and st.session_state.get("temp_input_path")
+            and st.session_state.get("last_processed_method")
+            != st.session_state.get("extraction_method")
+        ):
+            should_run = True
+
+        if should_run:
             with st.spinner("Enviando e processando a imagem da nota fiscal..."):
                 run_full_workflow()
     except Exception as exc:
         logging.exception("Invoice workflow failed: %s", exc)
+        st.session_state["last_processed_method"] = None
         st.error(f"Falha no processamento da nota fiscal: {exc}")
 
     if st.session_state.get("image_bytes"):
-        st.markdown("### Passo 3. Revisar foto")
+        st.markdown("### Passo 4. Revisar foto")
         st.toggle("Exibir pré-visualização", key="show_preview")
         render_image_preview()
 
     if st.session_state.get("qualified_data") is not None:
-        st.markdown("### Passo 4. Resultado qualificado")
+        st.markdown("### Passo 5. Resultado qualificado")
         render_qualified_result()
 
         st.divider()
-        st.markdown("### Passo 5. Recomeçar")
+        st.markdown("### Passo 6. Recomeçar")
         if st.button("Recomeçar", use_container_width=True):
             reset_workflow()
 

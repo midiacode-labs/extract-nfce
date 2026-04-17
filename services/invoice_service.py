@@ -24,6 +24,8 @@ try:
 except ImportError:
     ClientError = Exception
 
+from services.cost_estimation import build_textract_usage_summary
+
 
 class InvoiceExtractionService:
     """Service layer for invoice OCR parsing and AWS Textract image processing."""
@@ -39,6 +41,11 @@ class InvoiceExtractionService:
     ) -> None:
         self.region = region or os.environ.get("AWS_DEFAULT_REGION", "us-east-1")
         self.enable_preprocessing = enable_preprocessing
+        self.last_usage: Optional[Dict[str, Any]] = None
+
+    def get_last_usage(self) -> Optional[Dict[str, Any]]:
+        """Returns the usage summary from the last Textract extraction call."""
+        return self.last_usage
 
     @staticmethod
     def normalize_text(value: str) -> str:
@@ -618,8 +625,16 @@ class InvoiceExtractionService:
             return
 
         anchor_values: set[str] = set()
-        for key in ("code", "ncm", "cst", "cfop", "unit", "quantity",
-                     "unit_price", "total_price"):
+        for key in (
+            "code",
+            "ncm",
+            "cst",
+            "cfop",
+            "unit",
+            "quantity",
+            "unit_price",
+            "total_price",
+        ):
             val = item.get(key, "")
             if val and val.strip():
                 anchor_values.add(val.strip())
@@ -760,7 +775,10 @@ class InvoiceExtractionService:
             if not inside_items_section:
                 continue
 
-            if any(marker in upper_text for marker in ["DADOS ADICIONAIS", "RESERVADO AO FISCO", "RESERVAD"]):
+            if any(
+                marker in upper_text
+                for marker in ["DADOS ADICIONAIS", "RESERVADO AO FISCO", "RESERVAD"]
+            ):
                 flush_current_item()
                 break
 
@@ -1496,8 +1514,18 @@ class InvoiceExtractionService:
         logging.info("Starting extraction for file %s", input_file)
         output_path = self.resolve_output_path(input_file, output)
         response = self.analyze_image(input_file)
+        page_count = max(len(response.get("ExpenseDocuments", [])), 1)
+        self.last_usage = build_textract_usage_summary(page_count, self.region)
         logging.info("Starting data mapping and parsing phase.")
         final_data = self.parse_expense_data(response)
+
+        if self.last_usage:
+            logging.info(
+                "AWS Textract usage: pages=%s estimated_cost_usd=%s region=%s",
+                self.last_usage.get("page_count"),
+                self.last_usage.get("estimated_cost_usd"),
+                self.last_usage.get("region"),
+            )
 
         try:
             with open(output_path, "w", encoding="utf-8") as file_handle:
