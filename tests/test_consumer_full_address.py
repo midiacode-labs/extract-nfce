@@ -45,6 +45,51 @@ class ConsumerFullAddressTests(unittest.TestCase):
             "RUA ORQUIDEA, 109, 02363-320, Sao Paulo, JARDIM FLOR DE MAIO, SP",
         )
 
+    def test_ignores_destination_form_labels_for_address_fields(self):
+        response = {
+            "ExpenseDocuments": [
+                {
+                    "SummaryFields": [],
+                    "LineItemGroups": [],
+                    "Blocks": [
+                        {"BlockType": "LINE", "Text": "DESTINATARIO/REMETENTE"},
+                        {"BlockType": "LINE", "Text": "NOME / RAZAO SOCIAL"},
+                        {"BlockType": "LINE", "Text": "KENIA ARLEO"},
+                        {"BlockType": "LINE", "Text": "CPF/CNPJ"},
+                        {"BlockType": "LINE", "Text": "091.803.826-06"},
+                        {"BlockType": "LINE", "Text": "ENDERECO"},
+                        {"BlockType": "LINE", "Text": "AV MORVAN DIAS DE FIGUEIREDO, 3177"},
+                        {"BlockType": "LINE", "Text": "BAIRRO/DISTRITO"},
+                        {"BlockType": "LINE", "Text": "VILA GUILHERME"},
+                        {"BlockType": "LINE", "Text": "CEP"},
+                        {"BlockType": "LINE", "Text": "02063-000"},
+                        {"BlockType": "LINE", "Text": "MUNICIPIO"},
+                        {"BlockType": "LINE", "Text": "Sao Paulo"},
+                        {"BlockType": "LINE", "Text": "UF"},
+                        {"BlockType": "LINE", "Text": "SP"},
+                        {"BlockType": "LINE", "Text": "FONE/FAX"},
+                    ],
+                }
+            ]
+        }
+
+        data = parse_expense_data(response)
+
+        self.assertEqual(data["consumer"].get("name"), "KENIA ARLEO")
+        self.assertEqual(data["consumer"].get("document"), "091.803.826-06")
+        self.assertEqual(
+            data["consumer"].get("street"),
+            "AV MORVAN DIAS DE FIGUEIREDO, 3177",
+        )
+        self.assertEqual(data["consumer"].get("neighborhood"), "VILA GUILHERME")
+        self.assertEqual(data["consumer"].get("zip_code"), "02063-000")
+        self.assertEqual(data["consumer"].get("city"), "Sao Paulo")
+        self.assertEqual(data["consumer"].get("state"), "SP")
+        self.assertEqual(
+            data["consumer"].get("address"),
+            "AV MORVAN DIAS DE FIGUEIREDO, 3177, 02063-000, Sao Paulo, VILA GUILHERME, SP",
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

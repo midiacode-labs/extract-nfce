@@ -144,6 +144,9 @@ class InvoiceExtractionService:
         if len(normalized) < 5 or self.is_date_or_time(normalized):
             return False
 
+        if self.is_consumer_form_label(normalized):
+            return False
+
         if any(keyword in normalized for keyword in ["CPF", "CNPJ", "CONSUMIDOR", "DESTINAT"]):
             return False
 
@@ -161,6 +164,9 @@ class InvoiceExtractionService:
             return False
 
         upper_text = normalized.upper()
+        if self.is_consumer_form_label(upper_text):
+            return False
+
         blocked_keywords = [
             "CPF", "CNPJ", "CONSUMIDOR", "DESTINAT", "CALCULO", "CÁLCULO",
             "VALOR", "TOTAL", "TRIB", "INSCRICAO", "INSCRIÇÃO", "DATA",
@@ -186,7 +192,127 @@ class InvoiceExtractionService:
         if any(keyword in upper_text for keyword in ["CPF", "CNPJ", "CONSUMIDOR", "DESTINAT"]):
             return False
 
+        if self.is_consumer_form_label(upper_text):
+            return False
+
         return not self.is_street_candidate(normalized)
+
+    def should_use_consumer_name(
+        self,
+        candidate: str,
+        data: Dict[str, Any],
+    ) -> bool:
+        """Returns True when a detected name should be stored as consumer name."""
+        normalized_candidate = self.normalize_text(candidate)
+        if not self.is_name_candidate(normalized_candidate):
+            return False
+
+        current_name = self.normalize_text(data.get("consumer", {}).get("name", ""))
+        emitter_name = self.normalize_text(data.get("emitter", {}).get("company_name", ""))
+
+        candidate_upper = normalized_candidate.upper()
+        current_upper = current_name.upper()
+        emitter_upper = emitter_name.upper()
+
+        if emitter_upper and candidate_upper == emitter_upper:
+            return False
+
+        if not current_name:
+            return True
+
+        if emitter_upper and current_upper == emitter_upper:
+            return True
+
+        return False
+
+    @staticmethod
+    def is_consumer_form_label(text: str) -> bool:
+        """Returns True when the line looks like a destination form label, not a value."""
+        normalized = re.sub(r"\s+", " ", text).strip().upper()
+        if not normalized:
+            return False
+
+        exact_labels = {
+            "NOME / RAZAO SOCIAL",
+            "NOME / RAZÃO SOCIAL",
+            "CPF/CNPJ",
+            "CNPJ/CPF",
+            "DATA DA EMISSAO",
+            "DATA DA EMISSÃO",
+            "HORA DA EMISSAO",
+            "HORA DA EMISSÃO",
+            "DATA ENTRADA/SAIDA",
+            "DATA ENTRADA/SAÍDA",
+            "HORA ENTRADA/SAIDA",
+            "HORA ENTRADA/SAÍDA",
+            "ENDERECO",
+            "ENDEREÇO",
+            "BAIRRO/DISTRITO",
+            "CEP",
+            "MUNICIPIO",
+            "MUNICÍPIO",
+            "UF",
+            "FONE/FAX",
+            "INSCRICAO ESTADUAL",
+            "INSCRIÇÃO ESTADUAL",
+        }
+        if normalized in exact_labels:
+            return True
+
+        if "/" in normalized and any(
+            marker in normalized
+            for marker in [
+                "NOME",
+                "RAZAO SOCIAL",
+                "RAZÃO SOCIAL",
+                "DATA",
+                "EMISSAO",
+                "EMISSÃO",
+                "BAIRRO",
+                "DISTRITO",
+                "FONE",
+                "FAX",
+            ]
+        ):
+            return True
+
+        prefix_labels = [
+            "NOME ",
+            "RAZAO ",
+            "RAZÃO ",
+            "DATA ",
+            "HORA ",
+            "ENDERECO ",
+            "ENDEREÇO ",
+            "MUNICIPIO ",
+            "MUNICÍPIO ",
+            "BAIRRO ",
+            "CEP ",
+            "FONE ",
+            "INSCRICAO ",
+            "INSCRIÇÃO ",
+        ]
+        return any(normalized.startswith(prefix) for prefix in prefix_labels)
+
+    @staticmethod
+    def is_consumer_section_marker(text: str) -> bool:
+        """Returns True when the OCR line marks the consumer/destination block."""
+        normalized = re.sub(r"\s+", " ", text).strip().upper()
+        if not normalized:
+            return False
+
+        if "DESTINAT" in normalized:
+            return True
+
+        consumer_markers = [
+            "CONSUMIDOR",
+            "CONSUMIDOR FINAL",
+            "CONSUMIDOR NAO IDENTIFICADO",
+            "CONSUMIDOR NÃO IDENTIFICADO",
+            "IDENTIFICACAO DO CONSUMIDOR",
+            "IDENTIFICAÇÃO DO CONSUMIDOR",
+        ]
+        return normalized in consumer_markers
 
     @staticmethod
     def compose_consumer_address(consumer_data: Dict[str, Any]) -> None:
@@ -210,6 +336,9 @@ class InvoiceExtractionService:
         """Stores consumer address components from OCR or summary fields."""
         cleaned = re.sub(r"\s+", " ", value).strip(" ,;-")
         if not cleaned or self.is_date_or_time(cleaned) or self.extract_document_number(cleaned):
+            return
+
+        if self.is_consumer_form_label(cleaned):
             return
 
         if cleaned == consumer_data.get("name"):
@@ -491,7 +620,7 @@ class InvoiceExtractionService:
                 data["transport"].setdefault("freight_type", text)
 
             # Section markers
-            if any(kw in upper_text for kw in ["DESTINATA", "CONSUMIDOR"]):
+            if self.is_consumer_section_marker(upper_text):
                 consumer_lines_remaining = 15
                 prev_upper = upper_text
                 continue
@@ -515,10 +644,7 @@ class InvoiceExtractionService:
                     self.assign_detected_document(
                         text, data["consumer"], data["emitter"]
                     )
-                elif (
-                    "name" not in data["consumer"]
-                    and self.is_name_candidate(text)
-                ):
+                elif self.should_use_consumer_name(text, data):
                     data["consumer"]["name"] = text.strip()
                 else:
                     self.update_consumer_address(data["consumer"], text)
@@ -582,7 +708,8 @@ class InvoiceExtractionService:
                 elif type_name == "TOTAL":
                     data["totals"]["total_invoice_value"] = value
                 elif type_name in ("CUSTOMER_NAME", "RECEIVER_NAME", "NAME"):
-                    data["consumer"]["name"] = value
+                    if self.should_use_consumer_name(value, data):
+                        data["consumer"]["name"] = value
                 elif type_name == "RECEIVER_VAT_NUMBER":
                     data["consumer"]["document"] = value
                 elif type_name in (
