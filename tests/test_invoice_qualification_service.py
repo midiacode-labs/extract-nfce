@@ -36,7 +36,7 @@ class InvoiceQualificationServiceTests(unittest.TestCase):
             "items": [
                 {
                     "description": "CAFE 500G Trib aprox R$ 1,23",
-                    "amount": "12,90",
+                    "total_price": "12,90",
                     "quantity": "1",
                 }
             ],
@@ -60,12 +60,12 @@ class InvoiceQualificationServiceTests(unittest.TestCase):
         self.assertEqual(qualified_data["consumer"]["city"], "São Paulo")
         self.assertEqual(qualified_data["consumer"]["street"], "Avenida Paulista")
         self.assertEqual(qualified_data["items"][0]["description"], "CAFE 500G")
-        self.assertEqual(qualified_data["items"][0]["amount"], "12,90")
+        self.assertEqual(qualified_data["items"][0]["total_price"], "12,90")
         self.assertEqual(len(fake_client.responses.calls), 1)
 
     def test_qualify_file_writes_a_new_qualified_json(self):
         extracted_data = {
-            "header": {"vendor": "MERCADO MODELO"},
+            "emitter": {"company_name": "MERCADO MODELO"},
             "consumer": {"zip_code": "01310-100"},
             "items": [{"description": "ARROZ Trib aprox R$ 0,99"}],
         }

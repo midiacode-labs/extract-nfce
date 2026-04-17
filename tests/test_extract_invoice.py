@@ -21,7 +21,7 @@ class ParseExpenseDataTests(unittest.TestCase):
 
         data = parse_expense_data(response)
 
-        self.assertEqual(data["header"].get("cnpj"), "12.345.678/0001-90")
+        self.assertEqual(data["emitter"].get("cnpj"), "12.345.678/0001-90")
         self.assertIsNone(data["consumer"].get("document"))
 
     def test_extracts_consumer_address_from_summary_fields(self):

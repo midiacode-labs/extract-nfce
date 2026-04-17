@@ -37,12 +37,11 @@ class InvoiceExtractionService:
         match = re.search(r"\b\d{2}/\d{2}/\d{4}\b", text)
         return match.group() if match else None
 
-    def set_header_issue_date(self, header_data: Dict[str, Any], value: str) -> None:
-        """Stores the invoice issue date in the header using stable keys."""
+    def set_issue_date(self, identification: Dict[str, Any], value: str) -> None:
+        """Stores the invoice issue date in the identification section."""
         issue_date = self.extract_date(value)
         if issue_date:
-            header_data["date"] = issue_date
-            header_data["issue_date"] = issue_date
+            identification["issue_date"] = issue_date
 
     @staticmethod
     def validate_access_key(key: str) -> bool:
@@ -87,7 +86,7 @@ class InvoiceExtractionService:
         self,
         text: str,
         consumer_data: Dict[str, Any],
-        header_data: Dict[str, Any],
+        emitter_data: Dict[str, Any],
     ) -> None:
         """Routes OCR-detected documents to the correct JSON section."""
         document = self.extract_document_number(text)
@@ -108,7 +107,7 @@ class InvoiceExtractionService:
             if is_consumer_cnpj:
                 consumer_data.setdefault("document", document)
             else:
-                header_data.setdefault("cnpj", document)
+                emitter_data.setdefault("cnpj", document)
             return
 
         consumer_data.setdefault("document", document)
@@ -236,12 +235,325 @@ class InvoiceExtractionService:
 
         self.compose_consumer_address(consumer_data)
 
+    # ------------------------------------------------------------------
+    # Extraction helpers – label-based routing and block scanning
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _extract_protocol(text: str, identification: Dict[str, Any]) -> None:
+        """Extracts authorization protocol number and datetime from text."""
+        match = re.search(
+            r"(\d{15,})\s+(\d{2}/\d{2}/\d{4})\s+(\d{2}:\d{2}:\d{2})", text
+        )
+        if match:
+            identification["authorization_protocol"] = match.group(1)
+            identification["authorization_datetime"] = (
+                f"{match.group(2)} {match.group(3)}"
+            )
+            return
+
+        match = re.search(r"\d{15,}", text)
+        if match:
+            identification.setdefault("authorization_protocol", match.group())
+
+    def _classify_labeled_field(
+        self,
+        label: str,
+        value: str,
+        data: Dict[str, Any],
+    ) -> None:
+        """Routes OTHER SummaryFields to the correct section based on their label."""
+        ul = label.upper()
+
+        # Emitter
+        if any(kw in ul for kw in ["INSCRI", "INS. EST", "INSC EST"]):
+            data["emitter"].setdefault("state_registration", value)
+
+        # Identification
+        elif any(kw in ul for kw in ["NATUREZA", "NATURE"]):
+            data["identification"]["nature_of_operation"] = value
+        elif "PROTOCOLO" in ul:
+            self._extract_protocol(value, data["identification"])
+        elif "SÉRIE" in ul or "SERIE" in ul:
+            digits = re.sub(r"\D", "", value)
+            if digits:
+                data["identification"].setdefault("series", digits)
+        elif any(kw in ul for kw in ["NF-E N", "NFC-E N"]):
+            digits = re.sub(r"\D", "", value)
+            if digits:
+                data["identification"].setdefault("number", digits)
+        elif any(kw in ul for kw in ["PÁGINA", "PAGINA", "PÁG"]):
+            data["identification"]["page"] = value
+        elif "DATA" in ul and "EMISS" in ul:
+            self.set_issue_date(data["identification"], value)
+        elif "HORA" in ul and any(kw in ul for kw in ["SAÍDA", "SAIDA", "EMISS"]):
+            time_match = re.search(r"\d{1,2}:\d{2}(?::\d{2})?", value)
+            if time_match:
+                data["identification"]["issue_time"] = time_match.group()
+        elif "DATA" in ul and any(kw in ul for kw in ["ENT", "SAÍDA", "SAIDA"]):
+            date = self.extract_date(value)
+            if date:
+                data["identification"]["entry_exit_date"] = date
+
+        # Tax calculation (check ICMS ST before ICMS)
+        elif "BC" in ul and "ICMS" in ul and "ST" in ul:
+            data["tax_calculation"]["icms_st_basis"] = value
+        elif ("VALOR" in ul or "V." in ul) and "ICMS" in ul and "ST" in ul:
+            data["tax_calculation"]["icms_st_value"] = value
+        elif "BC" in ul and "ICMS" in ul:
+            data["tax_calculation"]["icms_basis"] = value
+        elif ("VALOR" in ul or "V." in ul) and "ICMS" in ul:
+            data["tax_calculation"]["icms_value"] = value
+        elif "IPI" in ul and ("VALOR" in ul or "V." in ul):
+            data["tax_calculation"]["ipi_value"] = value
+        elif "TOTAL" in ul and "PRODUTO" in ul:
+            data["tax_calculation"]["total_products_value"] = value
+        elif "FRETE" in ul and "POR CONTA" not in ul:
+            data["tax_calculation"]["freight_value"] = value
+        elif "SEGURO" in ul:
+            data["tax_calculation"]["insurance_value"] = value
+        elif "DESCONTO" in ul:
+            data["tax_calculation"]["discount"] = value
+        elif "OUTRAS" in ul and "DESPESA" in ul:
+            data["tax_calculation"]["other_expenses"] = value
+        elif "APROX" in ul and "TRIB" in ul:
+            data["tax_calculation"]["approximate_tax"] = value
+            data["fiscal_message"]["approximate_tax"] = value
+        elif "TOTAL" in ul and "NOTA" in ul:
+            data["tax_calculation"]["total_invoice_value"] = value
+            data["totals"].setdefault("total_invoice_value", value)
+
+        # Consumer
+        elif any(kw in ul for kw in ["CPF/CNPJ", "CNPJ/CPF", "CPF DEST", "CNPJ DEST"]):
+            doc = self.extract_document_number(value)
+            if doc:
+                data["consumer"]["document"] = doc
+        elif any(kw in ul for kw in ["DESTINAT", "NOME DO DEST"]):
+            data["consumer"]["name"] = value
+        elif any(kw in ul for kw in ["CEP", "CÓDIGO POSTAL", "CODIGO POSTAL"]):
+            data["consumer"]["zip_code"] = value.strip()
+            self.compose_consumer_address(data["consumer"])
+        elif "BAIRRO" in ul or "DISTRITO" in ul:
+            data["consumer"]["neighborhood"] = value.strip()
+            self.compose_consumer_address(data["consumer"])
+        elif any(kw in ul for kw in ["MUNICÍPIO", "MUNICIPIO", "CIDADE"]):
+            data["consumer"]["city"] = value.strip()
+            self.compose_consumer_address(data["consumer"])
+        elif "UF" in ul and len(ul) <= 15:
+            state = value.strip().upper()
+            if self.is_state_code(state):
+                data["consumer"]["state"] = state
+                self.compose_consumer_address(data["consumer"])
+        elif "FONE" in ul or "TELEFONE" in ul:
+            data["consumer"]["phone"] = value
+        elif any(kw in ul for kw in ["ENDEREÇO", "ENDERECO"]) and "EMITENTE" not in ul:
+            self.update_consumer_address(data["consumer"], value)
+
+        # Transport
+        elif any(kw in ul for kw in ["FRETE POR CONTA", "FRETE POR"]):
+            data["transport"]["freight_type"] = value
+        elif any(kw in ul for kw in ["CÓDIGO ANTT", "CODIGO ANTT"]):
+            data["transport"]["antt_code"] = value
+        elif "PLACA" in ul:
+            data["transport"]["vehicle_plate"] = value
+
+        # Totals / Payments
+        elif "FORMA" in ul and "PAGAMENTO" in ul:
+            data["totals"].setdefault("payments", []).append({"method": value})
+        elif "VALOR PAGO" in ul:
+            payments = data["totals"].get("payments", [])
+            if payments:
+                payments[-1]["amount"] = value
+            else:
+                data["totals"].setdefault("payments", [{"amount": value}])
+        elif "TROCO" in ul:
+            data["totals"]["change"] = value
+
+        # Additional info
+        elif any(
+            kw in ul
+            for kw in ["INFORMAÇÕES COMPLEMENTARES", "INFORMACOES COMPLEMENTARES"]
+        ):
+            data["additional_info"]["complementary_info"] = value
+        elif "RESERVADO" in ul and "FISCO" in ul:
+            data["additional_info"]["fiscal_notes"] = value
+
+        # Fallback
+        else:
+            self._fallback_classify(value, data)
+
+    def _fallback_classify(self, value: str, data: Dict[str, Any]) -> None:
+        """Fallback routing for OTHER fields without identifiable labels."""
+        document = self.extract_document_number(value)
+        if document:
+            self.assign_detected_document(value, data["consumer"], data["emitter"])
+        elif self.extract_date(value) and "issue_date" not in data["identification"]:
+            self.set_issue_date(data["identification"], value)
+
+    def _extract_item(self, line_item: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+        """Extracts a single item from a Textract LineItem."""
+        item: Dict[str, Any] = {}
+
+        for expense_field in line_item.get("LineItemExpenseFields", []):
+            if "Type" not in expense_field or "ValueDetection" not in expense_field:
+                continue
+
+            item_type = self.normalize_text(expense_field["Type"]["Text"])
+            item_val = self.normalize_text(expense_field["ValueDetection"]["Text"])
+
+            if item_type == "ITEM":
+                item["description"] = item_val
+            elif item_type == "PRICE":
+                item["total_price"] = item_val
+            elif item_type == "QUANTITY":
+                item["quantity"] = item_val
+            elif item_type == "UNIT_PRICE":
+                item["unit_price"] = item_val
+            elif item_type == "PRODUCT_CODE":
+                item["code"] = item_val
+            elif item_type == "EXPENSE_ROW":
+                item["expense_row"] = item_val
+            else:
+                key = item_type.lower().replace(" ", "_")
+                item[key] = item_val
+
+        return item if item else None
+
+    def _extract_from_blocks(
+        self, blocks: list, data: Dict[str, Any]
+    ) -> None:
+        """Scans OCR blocks for structured data not captured by SummaryFields."""
+        consumer_lines_remaining = 0
+        additional_info_lines = 0
+        prev_upper = ""
+
+        for block in blocks:
+            if block.get("BlockType") != "LINE":
+                continue
+
+            text = self.normalize_text(block.get("Text", ""))
+            upper_text = text.upper()
+            numbers = re.sub(r"\s+", "", text)
+
+            # Access key (44 digits)
+            if len(numbers) == 44 and numbers.isdigit():
+                data["access_key"]["key"] = numbers
+                data["access_key"]["is_valid"] = self.validate_access_key(numbers)
+
+            # CNPJ for emitter
+            cnpj = self.extract_cnpj(text)
+            if cnpj and "cnpj" not in data["emitter"]:
+                data["emitter"]["cnpj"] = cnpj
+
+            # Invoice number
+            nf_match = re.search(r"N[°º.]?\s*[:.]?\s*(\d{4,})", text)
+            if nf_match and "number" not in data["identification"]:
+                data["identification"]["number"] = nf_match.group(1)
+
+            # Series
+            serie_match = re.search(r"S[ÉE]RIE\s*[:.]?\s*(\d+)", upper_text)
+            if serie_match and "series" not in data["identification"]:
+                data["identification"]["series"] = serie_match.group(1)
+
+            # Page
+            page_match = re.search(
+                r"P[ÁA]G(?:INA)?\s*[:.]?\s*(\d+/\d+|\d+)", upper_text
+            )
+            if page_match and "page" not in data["identification"]:
+                data["identification"]["page"] = page_match.group(1)
+
+            # Protocol
+            if "PROTOCOLO" in prev_upper or "PROTOCOLO" in upper_text:
+                self._extract_protocol(text, data["identification"])
+
+            # Nature of operation (text on the line following the label)
+            if "NATUREZA" in prev_upper and "OPERA" in prev_upper:
+                if "nature_of_operation" not in data["identification"]:
+                    data["identification"]["nature_of_operation"] = text
+
+            # State registration
+            ie_match = re.search(
+                r"(?:INSCRI[ÇC][ÃA]O\s+ESTADUAL|INS\.?\s*EST)\s*[:\s]*(\d[\d./\s-]+\d)",
+                text,
+                re.IGNORECASE,
+            )
+            if ie_match:
+                data["emitter"].setdefault(
+                    "state_registration", re.sub(r"\s+", "", ie_match.group(1))
+                )
+
+            # Issue date from blocks
+            if "issue_date" not in data["identification"] and self.extract_date(text):
+                self.set_issue_date(data["identification"], text)
+
+            # Transport freight type
+            if re.search(r"\b(?:SEM\s+FRETE|CIF|FOB)\b", upper_text):
+                data["transport"].setdefault("freight_type", text)
+
+            # Section markers
+            if any(kw in upper_text for kw in ["DESTINATA", "CONSUMIDOR"]):
+                consumer_lines_remaining = 15
+                prev_upper = upper_text
+                continue
+
+            if "DADOS ADICIONAIS" in upper_text:
+                additional_info_lines = 10
+                prev_upper = upper_text
+                continue
+
+            if re.search(
+                r"INFORMA[ÇC][ÕO]ES\s+COMPLEMENTARES", upper_text
+            ):
+                additional_info_lines = 10
+                prev_upper = upper_text
+                continue
+
+            # Process consumer section blocks
+            if consumer_lines_remaining > 0:
+                document = self.extract_document_number(text)
+                if document:
+                    self.assign_detected_document(
+                        text, data["consumer"], data["emitter"]
+                    )
+                elif (
+                    "name" not in data["consumer"]
+                    and self.is_name_candidate(text)
+                ):
+                    data["consumer"]["name"] = text.strip()
+                else:
+                    self.update_consumer_address(data["consumer"], text)
+                consumer_lines_remaining -= 1
+
+            # Process additional info blocks
+            elif additional_info_lines > 0:
+                existing = data["additional_info"].get("complementary_info", "")
+                if existing:
+                    data["additional_info"]["complementary_info"] = (
+                        f"{existing} {text}"
+                    )
+                else:
+                    data["additional_info"]["complementary_info"] = text
+                additional_info_lines -= 1
+
+            prev_upper = upper_text
+
+    # ------------------------------------------------------------------
+    # Main extraction entry point
+    # ------------------------------------------------------------------
+
     def parse_expense_data(self, response: Dict[str, Any]) -> Dict[str, Any]:
-        """Maps an Analyze Expense response into the project JSON schema."""
-        extracted_data: Dict[str, Any] = {
-            "header": {},
-            "items": [],
+        """Maps an Analyze Expense response into the DANFE/NFC-e hierarchy."""
+        data: Dict[str, Any] = {
+            "emitter": {},
+            "identification": {},
             "consumer": {},
+            "items": [],
+            "totals": {},
+            "access_key": {},
+            "tax_calculation": {},
+            "transport": {},
+            "fiscal_message": {},
+            "additional_info": {},
         }
 
         for doc in response.get("ExpenseDocuments", []):
@@ -251,135 +563,101 @@ class InvoiceExtractionService:
 
                 type_name = self.normalize_text(field["Type"]["Text"])
                 value = self.normalize_text(field["ValueDetection"]["Text"])
+                label = self.normalize_text(
+                    field.get("LabelDetection", {}).get("Text", "")
+                )
 
                 if type_name == "VENDOR_NAME":
-                    extracted_data["header"]["vendor"] = value
+                    data["emitter"]["company_name"] = value
                 elif type_name == "VENDOR_VAT_NUMBER":
-                    extracted_data["header"]["cnpj"] = self.extract_cnpj(value) or value
-                elif type_name == "VENDOR_ADDRESS" and "cnpj" not in extracted_data["header"]:
-                    cnpj = self.extract_cnpj(value)
-                    if cnpj:
-                        extracted_data["header"]["cnpj"] = cnpj
+                    data["emitter"]["cnpj"] = self.extract_cnpj(value) or value
+                elif type_name == "VENDOR_ADDRESS":
+                    data["emitter"].setdefault("address", value)
+                    if "cnpj" not in data["emitter"]:
+                        cnpj = self.extract_cnpj(value)
+                        if cnpj:
+                            data["emitter"]["cnpj"] = cnpj
                 elif type_name in ("INVOICE_RECEIPT_DATE", "INVOICE_DATE"):
-                    self.set_header_issue_date(extracted_data["header"], value)
+                    self.set_issue_date(data["identification"], value)
                 elif type_name == "TOTAL":
-                    extracted_data["header"]["total_amount"] = value
+                    data["totals"]["total_invoice_value"] = value
                 elif type_name in ("CUSTOMER_NAME", "RECEIVER_NAME", "NAME"):
-                    extracted_data["consumer"]["name"] = value
+                    data["consumer"]["name"] = value
                 elif type_name == "RECEIVER_VAT_NUMBER":
-                    extracted_data["consumer"]["document"] = value
-                elif type_name in ("RECEIVER_ADDRESS", "CUSTOMER_ADDRESS", "BUYER_ADDRESS"):
-                    self.update_consumer_address(extracted_data["consumer"], value)
-                elif any(keyword in type_name.upper() for keyword in ["ZIP", "POSTAL", "CEP"]):
-                    extracted_data["consumer"]["zip_code"] = value.strip()
-                    self.compose_consumer_address(extracted_data["consumer"])
-                elif any(keyword in type_name.upper() for keyword in ["CITY", "MUNICIPALITY"]):
-                    extracted_data["consumer"]["city"] = value.strip()
-                    self.compose_consumer_address(extracted_data["consumer"])
-                elif any(
-                    keyword in type_name.upper()
-                    for keyword in ["NEIGHBOR", "DISTRICT", "BAIRRO"]
+                    data["consumer"]["document"] = value
+                elif type_name in (
+                    "RECEIVER_ADDRESS",
+                    "CUSTOMER_ADDRESS",
+                    "BUYER_ADDRESS",
                 ):
-                    extracted_data["consumer"]["neighborhood"] = value.strip()
-                    self.compose_consumer_address(extracted_data["consumer"])
-                elif any(keyword in type_name.upper() for keyword in ["STATE", "PROVINCE", "UF"]):
-                    extracted_data["consumer"]["state"] = value.strip().upper()
-                    self.compose_consumer_address(extracted_data["consumer"])
-                elif "ADDRESS" in type_name.upper() and not type_name.upper().startswith("VENDOR"):
-                    self.update_consumer_address(extracted_data["consumer"], value)
+                    self.update_consumer_address(data["consumer"], value)
                 elif any(
-                    keyword in type_name.upper()
-                    for keyword in ["CPF", "CONSUMIDOR", "CONSUMER", "DESTINATARIO", "DESTINATÁRIO"]
+                    kw in type_name.upper() for kw in ["ZIP", "POSTAL", "CEP"]
                 ):
-                    extracted_data["consumer"]["document"] = value
+                    data["consumer"]["zip_code"] = value.strip()
+                    self.compose_consumer_address(data["consumer"])
+                elif any(
+                    kw in type_name.upper() for kw in ["CITY", "MUNICIPALITY"]
+                ):
+                    data["consumer"]["city"] = value.strip()
+                    self.compose_consumer_address(data["consumer"])
+                elif any(
+                    kw in type_name.upper()
+                    for kw in ["NEIGHBOR", "DISTRICT", "BAIRRO"]
+                ):
+                    data["consumer"]["neighborhood"] = value.strip()
+                    self.compose_consumer_address(data["consumer"])
+                elif any(
+                    kw in type_name.upper()
+                    for kw in ["STATE", "PROVINCE", "UF"]
+                ):
+                    data["consumer"]["state"] = value.strip().upper()
+                    self.compose_consumer_address(data["consumer"])
+                elif (
+                    "ADDRESS" in type_name.upper()
+                    and not type_name.upper().startswith("VENDOR")
+                ):
+                    self.update_consumer_address(data["consumer"], value)
+                elif type_name == "PAYMENT_TERMS":
+                    data["totals"].setdefault("payments", []).append(
+                        {"method": value}
+                    )
+                elif any(
+                    kw in type_name.upper()
+                    for kw in [
+                        "CPF",
+                        "CONSUMIDOR",
+                        "CONSUMER",
+                        "DESTINATARIO",
+                        "DESTINATÁRIO",
+                    ]
+                ):
+                    data["consumer"]["document"] = value
                 elif (
                     any(
-                        keyword in value.upper()
-                        for keyword in ["CPF", "CNPJ", "DESTINATARIO", "DESTINATÁRIO"]
+                        kw in value.upper()
+                        for kw in ["CPF", "CNPJ", "DESTINATARIO", "DESTINATÁRIO"]
                     )
                     and type_name in ("OTHER", "CUSTOMER_NUMBER")
                 ):
                     self.assign_detected_document(
-                        value,
-                        extracted_data["consumer"],
-                        extracted_data["header"],
+                        value, data["consumer"], data["emitter"]
                     )
                 elif type_name == "OTHER":
-                    document = self.extract_document_number(value)
-                    if document:
-                        self.assign_detected_document(
-                            value,
-                            extracted_data["consumer"],
-                            extracted_data["header"],
-                        )
-                    elif self.extract_date(value) and "issue_date" not in extracted_data["header"]:
-                        self.set_header_issue_date(extracted_data["header"], value)
+                    if label:
+                        self._classify_labeled_field(label, value, data)
                     else:
-                        self.update_consumer_address(extracted_data["consumer"], value)
+                        self._fallback_classify(value, data)
 
             for group in doc.get("LineItemGroups", []):
                 for line_item in group.get("LineItems", []):
-                    item_details: Dict[str, Any] = {}
-                    for expense_field in line_item.get("LineItemExpenseFields", []):
-                        if "Type" not in expense_field or "ValueDetection" not in expense_field:
-                            continue
+                    item = self._extract_item(line_item)
+                    if item:
+                        data["items"].append(item)
 
-                        item_type = self.normalize_text(expense_field["Type"]["Text"])
-                        item_val = self.normalize_text(expense_field["ValueDetection"]["Text"])
+            self._extract_from_blocks(doc.get("Blocks", []), data)
 
-                        if item_type == "ITEM":
-                            item_details["description"] = item_val
-                        elif item_type == "PRICE":
-                            item_details["amount"] = item_val
-                        elif item_type == "QUANTITY":
-                            item_details["quantity"] = item_val
-                        else:
-                            item_details[item_type.lower()] = item_val
-
-                    if item_details:
-                        extracted_data["items"].append(item_details)
-
-            consumer_lines_to_check = 0
-            for block in doc.get("Blocks", []):
-                if block.get("BlockType") != "LINE":
-                    continue
-
-                text = self.normalize_text(block.get("Text", ""))
-                upper_text = text.upper()
-                numbers = re.sub(r"\s+", "", text)
-
-                if len(numbers) == 44 and numbers.isdigit():
-                    extracted_data["header"]["access_key"] = numbers
-                    extracted_data["header"]["is_access_key_valid"] = (
-                        self.validate_access_key(numbers)
-                    )
-
-                cnpj = self.extract_cnpj(text)
-                if cnpj and "cnpj" not in extracted_data["header"]:
-                    extracted_data["header"]["cnpj"] = cnpj
-
-                if "issue_date" not in extracted_data["header"] and self.extract_date(text):
-                    self.set_header_issue_date(extracted_data["header"], text)
-
-                if any(keyword in upper_text for keyword in ["DESTINATA", "CONSUMIDOR"]):
-                    consumer_lines_to_check = 15
-                    continue
-
-                if consumer_lines_to_check > 0:
-                    document = self.extract_document_number(text)
-                    if document:
-                        self.assign_detected_document(
-                            text,
-                            extracted_data["consumer"],
-                            extracted_data["header"],
-                        )
-                    elif "name" not in extracted_data["consumer"] and self.is_name_candidate(text):
-                        extracted_data["consumer"]["name"] = text.strip()
-                    else:
-                        self.update_consumer_address(extracted_data["consumer"], text)
-                    consumer_lines_to_check -= 1
-
-        return extracted_data
+        return data
 
     def resolve_output_path(self, input_file: str, output: Optional[str] = None) -> str:
         """Builds the destination JSON path inside the project output folder."""

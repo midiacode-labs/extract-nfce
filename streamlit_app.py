@@ -247,7 +247,7 @@ def render_items_table(items: list[Dict[str, Any]]) -> None:
             {
                 "#": index,
                 "Description": item.get("description", "—"),
-                "Amount": format_brl_currency(item.get("amount", "—")),
+                "Amount": format_brl_currency(item.get("total_price", "—")),
                 "Quantity": item.get("quantity", "—"),
             }
         )
@@ -278,8 +278,15 @@ def render_result_panel(
         consumer_name = data.get("consumer", {}).get("name") or "Not informed"
         st.metric("Consumer", consumer_name)
 
-    render_info_table("Header", data.get("header", {}))
+    render_info_table("Emitter", data.get("emitter", {}))
+    render_info_table("Identification", data.get("identification", {}))
     render_info_table("Consumer", data.get("consumer", {}))
+    render_info_table("Totals", data.get("totals", {}))
+    render_info_table("Access Key", data.get("access_key", {}))
+    render_info_table("Tax Calculation", data.get("tax_calculation", {}))
+    render_info_table("Transport", data.get("transport", {}))
+    render_info_table("Fiscal Message", data.get("fiscal_message", {}))
+    render_info_table("Additional Info", data.get("additional_info", {}))
     render_items_table(data.get("items", []))
 
     with st.expander("Show raw JSON", expanded=False):
