@@ -5,6 +5,16 @@ import re
 from typing import Any, Dict, Optional, Tuple
 
 try:
+    import cv2
+except ImportError:  # Allows parsing without image preprocessing dependencies
+    cv2 = None
+
+try:
+    import numpy as np
+except ImportError:
+    np = None
+
+try:
     import boto3
 except ImportError:  # Allows parser-only usage in minimal environments
     boto3 = None
@@ -19,9 +29,16 @@ class InvoiceExtractionService:
     """Service layer for invoice OCR parsing and AWS Textract image processing."""
 
     MAX_TEXTRACT_FILE_SIZE_MB = 10.0
+    PREPROCESS_MIN_DIMENSION = 1400
+    PREPROCESS_MAX_DIMENSION = 2200
 
-    def __init__(self, region: Optional[str] = None) -> None:
+    def __init__(
+        self,
+        region: Optional[str] = None,
+        enable_preprocessing: bool = True,
+    ) -> None:
         self.region = region or os.environ.get("AWS_DEFAULT_REGION", "us-east-1")
+        self.enable_preprocessing = enable_preprocessing
 
     @staticmethod
     def normalize_text(value: str) -> str:
@@ -810,6 +827,122 @@ class InvoiceExtractionService:
                 "(current size: %.2f MB)." % (input_file, file_size_mb)
             )
 
+    def validate_document_bytes_size(self, document_bytes: bytes, source: str) -> None:
+        """Raises an error when the processed image exceeds the Textract sync limit."""
+        file_size_mb = len(document_bytes) / (1024 * 1024)
+        if file_size_mb > self.MAX_TEXTRACT_FILE_SIZE_MB:
+            raise RuntimeError(
+                "Processed image derived from '%s' exceeds the 10MB limit supported by "
+                "AWS Textract (current size: %.2f MB)." % (source, file_size_mb)
+            )
+
+    @staticmethod
+    def _resize_for_ocr(image: Any) -> Any:
+        """Normalizes resolution to a range that improves OCR stability."""
+        height, width = image.shape[:2]
+        min_dimension = min(height, width)
+        max_dimension = max(height, width)
+
+        scale = 1.0
+        if min_dimension < InvoiceExtractionService.PREPROCESS_MIN_DIMENSION:
+            scale = InvoiceExtractionService.PREPROCESS_MIN_DIMENSION / float(min_dimension)
+        elif max_dimension > InvoiceExtractionService.PREPROCESS_MAX_DIMENSION:
+            scale = InvoiceExtractionService.PREPROCESS_MAX_DIMENSION / float(max_dimension)
+
+        if abs(scale - 1.0) < 0.01:
+            return image
+
+        resized = cv2.resize(
+            image,
+            None,
+            fx=scale,
+            fy=scale,
+            interpolation=cv2.INTER_CUBIC if scale > 1.0 else cv2.INTER_AREA,
+        )
+        return resized
+
+    @staticmethod
+    def _deskew(binary_image: Any) -> Any:
+        """Corrects small rotation angles commonly present in mobile captures."""
+        if np is None or cv2 is None:
+            return binary_image
+
+        coordinates = np.column_stack(np.where(binary_image < 200))
+        if len(coordinates) < 100:
+            return binary_image
+
+        angle = cv2.minAreaRect(coordinates)[-1]
+        if angle < -45:
+            angle = -(90 + angle)
+        else:
+            angle = -angle
+
+        if abs(angle) < 0.3 or abs(angle) > 15:
+            return binary_image
+
+        height, width = binary_image.shape[:2]
+        center = (width // 2, height // 2)
+        matrix = cv2.getRotationMatrix2D(center, angle, 1.0)
+        return cv2.warpAffine(
+            binary_image,
+            matrix,
+            (width, height),
+            flags=cv2.INTER_CUBIC,
+            borderMode=cv2.BORDER_CONSTANT,
+            borderValue=255,
+        )
+
+    def preprocess_image_bytes(self, image_bytes: bytes) -> bytes:
+        """Applies OCR-oriented image cleanup before sending bytes to Textract."""
+        if not self.enable_preprocessing:
+            return image_bytes
+
+        if cv2 is None or np is None:
+            logging.warning(
+                "OpenCV/Numpy are unavailable. Sending original image bytes to Textract."
+            )
+            return image_bytes
+
+        image_array = np.frombuffer(image_bytes, dtype=np.uint8)
+        image = cv2.imdecode(image_array, cv2.IMREAD_COLOR)
+        if image is None:
+            logging.warning("Image preprocessing skipped because decoding failed.")
+            return image_bytes
+
+        resized = self._resize_for_ocr(image)
+        grayscale = cv2.cvtColor(resized, cv2.COLOR_BGR2GRAY)
+        denoised = cv2.fastNlMeansDenoising(grayscale, None, 12, 7, 21)
+        contrast = cv2.createCLAHE(clipLimit=2.5, tileGridSize=(8, 8)).apply(denoised)
+        blurred = cv2.GaussianBlur(contrast, (0, 0), 1.1)
+        sharpened = cv2.addWeighted(contrast, 1.35, blurred, -0.35, 0)
+        thresholded = cv2.adaptiveThreshold(
+            sharpened,
+            255,
+            cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+            cv2.THRESH_BINARY,
+            31,
+            15,
+        )
+        cleaned = cv2.morphologyEx(
+            thresholded,
+            cv2.MORPH_OPEN,
+            np.ones((2, 2), dtype=np.uint8),
+        )
+        deskewed = self._deskew(cleaned)
+
+        success, encoded = cv2.imencode(".png", deskewed)
+        if not success:
+            logging.warning("Image preprocessing skipped because encoding failed.")
+            return image_bytes
+
+        processed_bytes = encoded.tobytes()
+        logging.info(
+            "Image preprocessing applied: %d bytes -> %d bytes.",
+            len(image_bytes),
+            len(processed_bytes),
+        )
+        return processed_bytes
+
     def create_textract_client(self):
         """Creates the AWS Textract client using the configured region."""
         if boto3 is None:
@@ -833,6 +966,9 @@ class InvoiceExtractionService:
         logging.info("Reading image bytes from %s and sending to AWS Textract.", input_file)
         with open(input_file, "rb") as img_file:
             img_bytes = img_file.read()
+
+        img_bytes = self.preprocess_image_bytes(img_bytes)
+        self.validate_document_bytes_size(img_bytes, input_file)
 
         try:
             response = client.analyze_expense(Document={"Bytes": img_bytes})
