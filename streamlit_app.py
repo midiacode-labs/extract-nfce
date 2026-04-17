@@ -16,16 +16,19 @@ from services.invoice_service import InvoiceExtractionService
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 
 STATE_DEFAULTS: Dict[str, Any] = {
+    "input_mode": "upload",
     "image_bytes": None,
     "image_name": None,
     "image_mime": "image/jpeg",
     "temp_input_path": None,
+    "show_preview": True,
     "extracted_data": None,
     "extracted_output_path": None,
     "extraction_duration": None,
     "qualified_data": None,
     "qualified_output_path": None,
     "qualification_duration": None,
+    "workflow_duration": None,
     "widget_nonce": 0,
 }
 
@@ -73,15 +76,15 @@ def persist_uploaded_file(uploaded_file) -> str:
     return file_path
 
 
-def set_selected_image(uploaded_file) -> None:
+def set_selected_image(uploaded_file) -> bool:
     """Stores the current uploaded or camera-captured image in session state."""
     if uploaded_file is None:
-        return
+        return False
 
     image_bytes = uploaded_file.getvalue()
     current_bytes = st.session_state.get("image_bytes")
     if current_bytes == image_bytes and st.session_state.get("temp_input_path"):
-        return
+        return False
 
     mime_type = uploaded_file.type or mimetypes.guess_type(uploaded_file.name or "")[0]
 
@@ -89,6 +92,7 @@ def set_selected_image(uploaded_file) -> None:
     st.session_state["image_name"] = uploaded_file.name or "invoice.jpg"
     st.session_state["image_mime"] = mime_type or "image/jpeg"
     st.session_state["temp_input_path"] = persist_uploaded_file(uploaded_file)
+    st.session_state["show_preview"] = True
 
     st.session_state["extracted_data"] = None
     st.session_state["extracted_output_path"] = None
@@ -96,6 +100,8 @@ def set_selected_image(uploaded_file) -> None:
     st.session_state["qualified_data"] = None
     st.session_state["qualified_output_path"] = None
     st.session_state["qualification_duration"] = None
+    st.session_state["workflow_duration"] = None
+    return True
 
 
 def run_extraction() -> None:
@@ -136,11 +142,22 @@ def run_qualification() -> None:
     st.session_state["qualification_duration"] = elapsed
 
 
+def run_full_workflow() -> None:
+    """Runs extraction and qualification sequentially for the current image."""
+    started_at = time.perf_counter()
+    run_extraction()
+    run_qualification()
+    st.session_state["workflow_duration"] = time.perf_counter() - started_at
+
+
 def render_image_preview() -> None:
     """Renders the current image preview with a zoom slider."""
     image_bytes = st.session_state.get("image_bytes")
     if not image_bytes:
-        st.info("Upload an image or use the camera input to begin.")
+        return
+
+    if not st.session_state.get("show_preview", True):
+        st.caption("Photo preview hidden.")
         return
 
     st.subheader("Invoice preview")
@@ -296,27 +313,15 @@ def render_result_panel(
         st.caption(f"Saved to: {output_path}")
 
 
-def render_results() -> None:
-    """Displays the extracted and qualified result blocks side by side."""
-    left_column, right_column = st.columns(2)
-
-    with left_column:
-        render_result_panel(
-            title="Extracted result",
-            data=st.session_state.get("extracted_data"),
-            duration=st.session_state.get("extraction_duration"),
-            output_path=st.session_state.get("extracted_output_path"),
-            empty_message="The extraction result will appear here.",
-        )
-
-    with right_column:
-        render_result_panel(
-            title="Qualified result",
-            data=st.session_state.get("qualified_data"),
-            duration=st.session_state.get("qualification_duration"),
-            output_path=st.session_state.get("qualified_output_path"),
-            empty_message="The qualified result will appear here after the second step.",
-        )
+def render_qualified_result() -> None:
+    """Displays only the qualified result after processing completes."""
+    render_result_panel(
+        title="Qualified result",
+        data=st.session_state.get("qualified_data"),
+        duration=st.session_state.get("workflow_duration"),
+        output_path=st.session_state.get("qualified_output_path"),
+        empty_message="The qualified result will appear here after the image is processed.",
+    )
 
 
 def main() -> None:
@@ -326,58 +331,57 @@ def main() -> None:
 
     st.title("🧾 Invoice Extractor UI")
     st.write(
-        "Upload an invoice image or capture it with the device camera, then compare the "
-        "raw extraction with the qualified output."
+        "Follow the guided steps to send an invoice image and review the qualified data."
     )
-
-    upload_column, camera_column = st.columns(2)
     nonce = st.session_state.get("widget_nonce", 0)
 
-    with upload_column:
-        uploaded_file = st.file_uploader(
+    st.markdown("### Step 1. Choose Input Method")
+    st.radio(
+        "How would you like to provide the invoice image?",
+        options=["upload", "camera"],
+        format_func=lambda option: "Upload file" if option == "upload" else "Use camera",
+        key="input_mode",
+        horizontal=True,
+    )
+
+    st.markdown("### Step 2. Provide The Image")
+    selected_file = None
+    if st.session_state.get("input_mode") == "upload":
+        selected_file = st.file_uploader(
             "Upload invoice image",
             type=["jpg", "jpeg", "png"],
             key=f"file_uploader_{nonce}",
         )
-        if uploaded_file is not None:
-            set_selected_image(uploaded_file)
-
-    with camera_column:
-        camera_file = st.camera_input(
-            "Or capture using the phone camera",
+    else:
+        selected_file = st.camera_input(
+            "Take a photo of the invoice",
             key=f"camera_input_{nonce}",
         )
-        if camera_file is not None:
-            set_selected_image(camera_file)
 
-    render_image_preview()
+    if selected_file is None and st.session_state.get("image_bytes") is None:
+        st.info("Choose an input method and send the invoice image to continue.")
 
-    button_column_1, button_column_2, button_column_3 = st.columns(3)
+    try:
+        if set_selected_image(selected_file):
+            with st.spinner("Uploading and processing the invoice image..."):
+                run_full_workflow()
+    except Exception as exc:
+        logging.exception("Invoice workflow failed: %s", exc)
+        st.error(f"Invoice workflow failed: {exc}")
 
-    with button_column_1:
-        if st.button("1. Extract invoice JSON", type="primary", use_container_width=True):
-            try:
-                with st.spinner("Running invoice extraction..."):
-                    run_extraction()
-            except Exception as exc:
-                logging.exception("Invoice extraction failed: %s", exc)
-                st.error(f"Invoice extraction failed: {exc}")
+    if st.session_state.get("image_bytes"):
+        st.markdown("### Step 3. Review Photo")
+        st.toggle("Show photo preview", key="show_preview")
+        render_image_preview()
 
-    with button_column_2:
-        if st.button("2. Qualify extracted JSON", use_container_width=True):
-            try:
-                with st.spinner("Running qualification service..."):
-                    run_qualification()
-            except Exception as exc:
-                logging.exception("Invoice qualification failed: %s", exc)
-                st.error(f"Invoice qualification failed: {exc}")
+    if st.session_state.get("qualified_data") is not None:
+        st.markdown("### Step 4. Qualified Result")
+        render_qualified_result()
 
-    with button_column_3:
+        st.divider()
+        st.markdown("### Step 5. Start Over")
         if st.button("Reset", use_container_width=True):
             reset_workflow()
-
-    st.divider()
-    render_results()
 
 
 if __name__ == "__main__":
