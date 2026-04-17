@@ -47,6 +47,79 @@ class ItemTextNormalizationTests(unittest.TestCase):
             "395863 TV SMART 1.0000 2,499.00",
         )
 
+    def test_refines_truncated_description_from_expense_row(self):
+        """When Textract truncates the ITEM field, the full product name is
+        recovered from the EXPENSE_ROW using known field values as anchors."""
+        response = {
+            "ExpenseDocuments": [
+                {
+                    "SummaryFields": [],
+                    "LineItemGroups": [
+                        {
+                            "LineItems": [
+                                {
+                                    "LineItemExpenseFields": [
+                                        {
+                                            "Type": {"Text": "PRODUCT_CODE"},
+                                            "ValueDetection": {"Text": "4020529"},
+                                        },
+                                        {
+                                            "Type": {"Text": "ITEM"},
+                                            "ValueDetection": {
+                                                "Text": "SMARTPHONE SAMSUNG"
+                                            },
+                                        },
+                                        {
+                                            "Type": {"Text": "NCM"},
+                                            "ValueDetection": {"Text": "85171300"},
+                                        },
+                                        {
+                                            "Type": {"Text": "CST"},
+                                            "ValueDetection": {"Text": "060"},
+                                        },
+                                        {
+                                            "Type": {"Text": "CFOP"},
+                                            "ValueDetection": {"Text": "5029"},
+                                        },
+                                        {
+                                            "Type": {"Text": "UNIT"},
+                                            "ValueDetection": {"Text": "UN"},
+                                        },
+                                        {
+                                            "Type": {"Text": "QUANTITY"},
+                                            "ValueDetection": {"Text": "1.0000"},
+                                        },
+                                        {
+                                            "Type": {"Text": "UNIT_PRICE"},
+                                            "ValueDetection": {"Text": "999.0000"},
+                                        },
+                                        {
+                                            "Type": {"Text": "PRICE"},
+                                            "ValueDetection": {"Text": "999.00"},
+                                        },
+                                        {
+                                            "Type": {"Text": "EXPENSE_ROW"},
+                                            "ValueDetection": {
+                                                "Text": "4020529 SMARTPHONE SAMSUNG G 85171300 060 5029 UN 1.0000 999.0000 999.00"
+                                            },
+                                        },
+                                    ]
+                                }
+                            ]
+                        }
+                    ],
+                    "Blocks": [],
+                }
+            ]
+        }
+
+        data = parse_expense_data(response)
+
+        self.assertEqual(
+            data["items"][0]["description"],
+            "SMARTPHONE SAMSUNG G",
+        )
+
     def test_extracts_items_from_block_lines_when_textract_has_no_line_items(self):
         response = {
             "ExpenseDocuments": [

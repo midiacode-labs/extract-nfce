@@ -90,13 +90,21 @@ class InvoiceQualificationServiceTests(unittest.TestCase):
             self.assertTrue(os.path.exists(qualified_path))
             self.assertEqual(qualified_data["items"][0]["description"], "ARROZ")
 
-    def test_fix_item_total_price_recalculates_when_wrong(self):
+    def test_fix_prices_leaves_conflicting_values_unchanged(self):
+        """When both unit_price and total_price exist but disagree, neither
+        is overwritten because OCR can misread either field."""
         service = InvoiceQualificationService(api_key=None, client=None)
         extracted_data = {
             "consumer": {},
             "items": [
                 {
-                    "description": "SECADOR DE CABELO",
+                    "description": "MOUSE C FIO HP",
+                    "quantity": "1,0000",
+                    "unit_price": "22.9600",
+                    "total_price": "22.98",
+                },
+                {
+                    "description": "SECADOR DE CABELO MO",
                     "quantity": "1,0000",
                     "unit_price": "139.0000",
                     "total_price": "130.00",
@@ -111,11 +119,18 @@ class InvoiceQualificationServiceTests(unittest.TestCase):
         }
         qualified = service.apply_local_fixes(extracted_data)
 
-        self.assertEqual(qualified["items"][0]["total_price"], "139.00")
-        # Item 2 already matches (2 * 119 = 238), should remain unchanged
-        self.assertEqual(qualified["items"][1]["total_price"], "238.00")
+        # Item 1: values conflict (22.96 != 22.98) — both left as-is
+        self.assertEqual(qualified["items"][0]["unit_price"], "22.9600")
+        self.assertEqual(qualified["items"][0]["total_price"], "22.98")
+        # Item 2: values conflict (139 != 130) — both left as-is
+        self.assertEqual(qualified["items"][1]["unit_price"], "139.0000")
+        self.assertEqual(qualified["items"][1]["total_price"], "130.00")
+        # Item 3: already consistent (2 * 119 = 238), unchanged
+        self.assertEqual(qualified["items"][2]["unit_price"], "119.0000")
+        self.assertEqual(qualified["items"][2]["total_price"], "238.00")
 
-    def test_fix_item_total_price_preserves_brazilian_format(self):
+    def test_fix_prices_computes_total_when_missing(self):
+        """When total_price is missing, it is computed from unit_price * qty."""
         service = InvoiceQualificationService(api_key=None, client=None)
         extracted_data = {
             "consumer": {},
@@ -124,15 +139,33 @@ class InvoiceQualificationServiceTests(unittest.TestCase):
                     "description": "CAFE 500G",
                     "quantity": "3",
                     "unit_price": "12,90",
-                    "total_price": "35,70",
                 },
             ],
         }
         qualified = service.apply_local_fixes(extracted_data)
 
         self.assertEqual(qualified["items"][0]["total_price"], "38,70")
+        self.assertEqual(qualified["items"][0]["unit_price"], "12,90")
 
-    def test_fix_item_total_price_skips_when_fields_missing(self):
+    def test_fix_prices_computes_unit_price_when_missing(self):
+        """When unit_price is missing, it is computed from total_price / qty."""
+        service = InvoiceQualificationService(api_key=None, client=None)
+        extracted_data = {
+            "consumer": {},
+            "items": [
+                {
+                    "description": "ARROZ 5KG",
+                    "quantity": "2",
+                    "total_price": "39.80",
+                },
+            ],
+        }
+        qualified = service.apply_local_fixes(extracted_data)
+
+        self.assertEqual(qualified["items"][0]["unit_price"], "19.9000")
+        self.assertEqual(qualified["items"][0]["total_price"], "39.80")
+
+    def test_fix_prices_skips_when_fields_missing(self):
         service = InvoiceQualificationService(api_key=None, client=None)
         extracted_data = {
             "consumer": {},
@@ -145,7 +178,7 @@ class InvoiceQualificationServiceTests(unittest.TestCase):
         }
         qualified = service.apply_local_fixes(extracted_data)
 
-        # No unit_price/quantity, so total_price stays as-is
+        # No unit_price/quantity, so prices stay as-is
         self.assertEqual(qualified["items"][0]["total_price"], "9,99")
 
 

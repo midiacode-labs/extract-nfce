@@ -599,7 +599,45 @@ class InvoiceExtractionService:
                 key = item_type.lower().replace(" ", "_")
                 item[key] = item_val
 
+        if item:
+            self._refine_description_from_expense_row(item)
+
         return item if item else None
+
+    @staticmethod
+    def _refine_description_from_expense_row(item: Dict[str, Any]) -> None:
+        """Recovers a more complete description from the expense_row when Textract
+        truncated the ITEM field."""
+        expense_row = item.get("expense_row", "")
+        description = item.get("description", "")
+        if not expense_row or not description:
+            return
+
+        desc_pos = expense_row.find(description)
+        if desc_pos < 0:
+            return
+
+        anchor_values: set[str] = set()
+        for key in ("code", "ncm", "cst", "cfop", "unit", "quantity",
+                     "unit_price", "total_price"):
+            val = item.get(key, "")
+            if val and val.strip():
+                anchor_values.add(val.strip())
+
+        after = expense_row[desc_pos + len(description):]
+        remaining_tokens = after.split()
+
+        if not any(token in anchor_values for token in remaining_tokens):
+            return
+
+        extra_words: list[str] = []
+        for token in remaining_tokens:
+            if token in anchor_values:
+                break
+            extra_words.append(token)
+
+        if extra_words:
+            item["description"] = description + " " + " ".join(extra_words)
 
     @staticmethod
     def _is_items_section_marker(text: str) -> bool:

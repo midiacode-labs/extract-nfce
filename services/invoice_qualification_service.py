@@ -82,7 +82,7 @@ class InvoiceQualificationService:
             description = item.get("description")
             if description:
                 item["description"] = self.sanitize_item_description(description)
-            self.fix_item_total_price(item)
+            self.fix_item_prices(item)
 
         return qualified_data
 
@@ -92,26 +92,37 @@ class InvoiceQualificationService:
         return InvoiceExtractionService.parse_decimal(value)
 
     @classmethod
-    def fix_item_total_price(cls, item: Dict[str, Any]) -> None:
-        """Recalculates total_price when unit_price * quantity diverges from it."""
+    def fix_item_prices(cls, item: Dict[str, Any]) -> None:
+        """Fills in a missing unit_price or total_price when the other is available.
+
+        When both values are present but disagree, neither is overwritten
+        because OCR can misread either field — we cannot reliably determine
+        which one is correct.  Only genuinely missing values are computed.
+        """
         unit_price = cls._parse_br_decimal(item.get("unit_price", ""))
         quantity = cls._parse_br_decimal(item.get("quantity", ""))
         total_price = cls._parse_br_decimal(item.get("total_price", ""))
 
-        if unit_price is None or quantity is None:
+        if quantity is None or quantity == 0:
             return
 
-        expected = round(unit_price * quantity, 2)
+        # Detect format convention from whichever value is present
+        reference_value = item.get("unit_price", "") or item.get("total_price", "")
+        uses_br_format = "," in reference_value and "." not in reference_value
 
-        if total_price is not None and abs(total_price - expected) < 0.01:
-            return
+        if total_price is None and unit_price is not None:
+            computed = round(unit_price * quantity, 2)
+            if uses_br_format:
+                item["total_price"] = f"{computed:,.2f}".replace(",", "X").replace(".", ",").replace("X", ".")
+            else:
+                item["total_price"] = f"{computed:.2f}"
 
-        # Format with the same decimal separator used in the original value
-        original = item.get("total_price", "")
-        if "," in original and "." not in original:
-            item["total_price"] = f"{expected:,.2f}".replace(",", "X").replace(".", ",").replace("X", ".")
-        else:
-            item["total_price"] = f"{expected:.2f}"
+        elif unit_price is None and total_price is not None:
+            computed = round(total_price / quantity, 4)
+            if uses_br_format:
+                item["unit_price"] = f"{computed:,.4f}".replace(",", "X").replace(".", ",").replace("X", ".")
+            else:
+                item["unit_price"] = f"{computed:.4f}"
 
     def build_messages(self, extracted_data: Dict[str, Any]) -> List[Dict[str, Any]]:
         """Builds the prompt sent to the OpenAI Responses API."""
