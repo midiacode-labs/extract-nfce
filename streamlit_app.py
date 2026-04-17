@@ -16,16 +16,19 @@ from services.invoice_service import InvoiceExtractionService
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 
 STATE_DEFAULTS: Dict[str, Any] = {
+    "input_mode": "upload",
     "image_bytes": None,
     "image_name": None,
     "image_mime": "image/jpeg",
     "temp_input_path": None,
+    "show_preview": True,
     "extracted_data": None,
     "extracted_output_path": None,
     "extraction_duration": None,
     "qualified_data": None,
     "qualified_output_path": None,
     "qualification_duration": None,
+    "workflow_duration": None,
     "widget_nonce": 0,
 }
 
@@ -49,12 +52,12 @@ def reset_workflow() -> None:
 def format_duration(seconds: float) -> str:
     """Formats a duration in a friendly way for the UI."""
     if seconds < 60:
-        return f"{seconds:.2f} seconds"
+        return f"{seconds:.2f} segundos"
 
     minutes = int(seconds // 60)
     remaining_seconds = seconds % 60
     if minutes < 60:
-        return f"{minutes} min {remaining_seconds:.1f} sec"
+        return f"{minutes} min {remaining_seconds:.1f} seg"
 
     hours = minutes // 60
     remaining_minutes = minutes % 60
@@ -73,15 +76,15 @@ def persist_uploaded_file(uploaded_file) -> str:
     return file_path
 
 
-def set_selected_image(uploaded_file) -> None:
+def set_selected_image(uploaded_file) -> bool:
     """Stores the current uploaded or camera-captured image in session state."""
     if uploaded_file is None:
-        return
+        return False
 
     image_bytes = uploaded_file.getvalue()
     current_bytes = st.session_state.get("image_bytes")
     if current_bytes == image_bytes and st.session_state.get("temp_input_path"):
-        return
+        return False
 
     mime_type = uploaded_file.type or mimetypes.guess_type(uploaded_file.name or "")[0]
 
@@ -89,6 +92,7 @@ def set_selected_image(uploaded_file) -> None:
     st.session_state["image_name"] = uploaded_file.name or "invoice.jpg"
     st.session_state["image_mime"] = mime_type or "image/jpeg"
     st.session_state["temp_input_path"] = persist_uploaded_file(uploaded_file)
+    st.session_state["show_preview"] = True
 
     st.session_state["extracted_data"] = None
     st.session_state["extracted_output_path"] = None
@@ -96,13 +100,15 @@ def set_selected_image(uploaded_file) -> None:
     st.session_state["qualified_data"] = None
     st.session_state["qualified_output_path"] = None
     st.session_state["qualification_duration"] = None
+    st.session_state["workflow_duration"] = None
+    return True
 
 
 def run_extraction() -> None:
     """Runs the Textract invoice extraction service for the current image."""
     input_path = st.session_state.get("temp_input_path")
     if not input_path:
-        st.warning("Please upload or capture an invoice image first.")
+        st.warning("Envie ou capture uma imagem da nota fiscal primeiro.")
         return
 
     service = InvoiceExtractionService()
@@ -120,7 +126,7 @@ def run_qualification() -> None:
     extracted_data = st.session_state.get("extracted_data")
     output_path = st.session_state.get("extracted_output_path")
     if not extracted_data or not output_path:
-        st.warning("Run the extraction step before qualifying the JSON.")
+        st.warning("Execute a etapa de extração antes de qualificar o JSON.")
         return
 
     service = InvoiceQualificationService()
@@ -136,14 +142,25 @@ def run_qualification() -> None:
     st.session_state["qualification_duration"] = elapsed
 
 
+def run_full_workflow() -> None:
+    """Runs extraction and qualification sequentially for the current image."""
+    started_at = time.perf_counter()
+    run_extraction()
+    run_qualification()
+    st.session_state["workflow_duration"] = time.perf_counter() - started_at
+
+
 def render_image_preview() -> None:
     """Renders the current image preview with a zoom slider."""
     image_bytes = st.session_state.get("image_bytes")
     if not image_bytes:
-        st.info("Upload an image or use the camera input to begin.")
         return
 
-    st.subheader("Invoice preview")
+    if not st.session_state.get("show_preview", True):
+        st.caption("Pré-visualização oculta.")
+        return
+
+    st.subheader("Pré-visualização da nota")
     zoom_percent = st.slider("Zoom", min_value=60, max_value=200, value=100, step=10)
 
     encoded_image = base64.b64encode(image_bytes).decode("utf-8")
@@ -178,15 +195,8 @@ def format_brl_currency(value: Any) -> str:
     if not text:
         return "—"
 
-    cleaned = text.replace("R$", "").replace(" ", "")
-    if "," in cleaned and "." in cleaned:
-        cleaned = cleaned.replace(".", "").replace(",", ".")
-    elif "," in cleaned:
-        cleaned = cleaned.replace(",", ".")
-
-    try:
-        number = float(cleaned)
-    except ValueError:
+    number = InvoiceExtractionService.parse_decimal(text.replace("R$", "").strip())
+    if number is None:
         return html.escape(text)
 
     formatted = f"R$ {number:,.2f}"
@@ -209,7 +219,7 @@ def render_info_table(title: str, data: Dict[str, Any]) -> None:
     """Renders a friendly HTML table for a JSON section."""
     st.markdown(f"#### {title}")
     if not data:
-        st.info("No data detected in this section.")
+        st.info("Nenhum dado detectado nesta seção.")
         return
 
     rows = []
@@ -236,9 +246,9 @@ def render_info_table(title: str, data: Dict[str, Any]) -> None:
 
 def render_items_table(items: list[Dict[str, Any]]) -> None:
     """Renders the detected invoice items in a friendly table."""
-    st.markdown("#### Items")
+    st.markdown("#### Itens")
     if not items:
-        st.info("No items detected.")
+        st.info("Nenhum item detectado.")
         return
 
     normalized_items = []
@@ -246,9 +256,10 @@ def render_items_table(items: list[Dict[str, Any]]) -> None:
         normalized_items.append(
             {
                 "#": index,
-                "Description": item.get("description", "—"),
-                "Amount": format_brl_currency(item.get("amount", "—")),
-                "Quantity": item.get("quantity", "—"),
+                "Descrição": item.get("description", "—"),
+                "Qtd": item.get("quantity", "—"),
+                "Valor Unit.": format_brl_currency(item.get("unit_price", "—")),
+                "Valor Total": format_brl_currency(item.get("total_price", "—")),
             }
         )
 
@@ -269,108 +280,102 @@ def render_result_panel(
         return
 
     if duration is not None:
-        st.success(f"Completed in {format_duration(duration)}.")
+        st.success(f"Concluído em {format_duration(duration)}.")
 
     summary_column_1, summary_column_2 = st.columns(2)
     with summary_column_1:
-        st.metric("Detected items", len(data.get("items", [])))
+        st.metric("Itens detectados", len(data.get("items", [])))
     with summary_column_2:
-        consumer_name = data.get("consumer", {}).get("name") or "Not informed"
-        st.metric("Consumer", consumer_name)
+        consumer_name = data.get("consumer", {}).get("name") or "Não informado"
+        st.metric("Consumidor", consumer_name)
 
-    render_info_table("Header", data.get("header", {}))
-    render_info_table("Consumer", data.get("consumer", {}))
+    render_info_table("Emitente", data.get("emitter", {}))
+    render_info_table("Identificação", data.get("identification", {}))
+    render_info_table("Consumidor", data.get("consumer", {}))
+    render_info_table("Totais", data.get("totals", {}))
+    render_info_table("Chave de Acesso", data.get("access_key", {}))
+    render_info_table("Cálculo do Imposto", data.get("tax_calculation", {}))
+    render_info_table("Transporte", data.get("transport", {}))
+    render_info_table("Mensagem Fiscal", data.get("fiscal_message", {}))
+    render_info_table("Informações Adicionais", data.get("additional_info", {}))
     render_items_table(data.get("items", []))
 
-    with st.expander("Show raw JSON", expanded=False):
+    with st.expander("Exibir JSON bruto", expanded=False):
         st.json(data)
 
     if output_path:
-        st.caption(f"Saved to: {output_path}")
+        st.caption(f"Salvo em: {output_path}")
 
 
-def render_results() -> None:
-    """Displays the extracted and qualified result blocks side by side."""
-    left_column, right_column = st.columns(2)
-
-    with left_column:
-        render_result_panel(
-            title="Extracted result",
-            data=st.session_state.get("extracted_data"),
-            duration=st.session_state.get("extraction_duration"),
-            output_path=st.session_state.get("extracted_output_path"),
-            empty_message="The extraction result will appear here.",
-        )
-
-    with right_column:
-        render_result_panel(
-            title="Qualified result",
-            data=st.session_state.get("qualified_data"),
-            duration=st.session_state.get("qualification_duration"),
-            output_path=st.session_state.get("qualified_output_path"),
-            empty_message="The qualified result will appear here after the second step.",
-        )
+def render_qualified_result() -> None:
+    """Displays only the qualified result after processing completes."""
+    render_result_panel(
+        title="Resultado qualificado",
+        data=st.session_state.get("qualified_data"),
+        duration=st.session_state.get("workflow_duration"),
+        output_path=st.session_state.get("qualified_output_path"),
+        empty_message="O resultado qualificado aparecerá aqui após o processamento da imagem.",
+    )
 
 
 def main() -> None:
     """Runs the Streamlit UI for invoice extraction and qualification."""
-    st.set_page_config(page_title="Invoice Extractor UI", page_icon="🧾", layout="wide")
+    st.set_page_config(page_title="Extrator de Notas Fiscais", page_icon="🧾", layout="wide")
     init_state()
 
-    st.title("🧾 Invoice Extractor UI")
+    st.title("🧾 Extrator de Notas Fiscais")
     st.write(
-        "Upload an invoice image or capture it with the device camera, then compare the "
-        "raw extraction with the qualified output."
+        "Siga os passos abaixo para enviar uma imagem da nota fiscal e revisar os dados qualificados."
     )
-
-    upload_column, camera_column = st.columns(2)
     nonce = st.session_state.get("widget_nonce", 0)
 
-    with upload_column:
-        uploaded_file = st.file_uploader(
-            "Upload invoice image",
+    st.markdown("### Passo 1. Escolha o método de envio")
+    st.radio(
+        "Como você deseja enviar a imagem da nota fiscal?",
+        options=["upload", "camera"],
+        format_func=lambda option: "Enviar arquivo" if option == "upload" else "Usar câmera",
+        key="input_mode",
+        horizontal=True,
+    )
+
+    st.markdown("### Passo 2. Envie a imagem")
+    selected_file = None
+    if st.session_state.get("input_mode") == "upload":
+        selected_file = st.file_uploader(
+            "Enviar imagem da nota fiscal",
             type=["jpg", "jpeg", "png"],
             key=f"file_uploader_{nonce}",
         )
-        if uploaded_file is not None:
-            set_selected_image(uploaded_file)
-
-    with camera_column:
-        camera_file = st.camera_input(
-            "Or capture using the phone camera",
+    else:
+        selected_file = st.camera_input(
+            "Tire uma foto da nota fiscal",
             key=f"camera_input_{nonce}",
         )
-        if camera_file is not None:
-            set_selected_image(camera_file)
 
-    render_image_preview()
+    if selected_file is None and st.session_state.get("image_bytes") is None:
+        st.info("Escolha um método de envio e envie a imagem da nota fiscal para continuar.")
 
-    button_column_1, button_column_2, button_column_3 = st.columns(3)
+    try:
+        if set_selected_image(selected_file):
+            with st.spinner("Enviando e processando a imagem da nota fiscal..."):
+                run_full_workflow()
+    except Exception as exc:
+        logging.exception("Invoice workflow failed: %s", exc)
+        st.error(f"Falha no processamento da nota fiscal: {exc}")
 
-    with button_column_1:
-        if st.button("1. Extract invoice JSON", type="primary", use_container_width=True):
-            try:
-                with st.spinner("Running invoice extraction..."):
-                    run_extraction()
-            except Exception as exc:
-                logging.exception("Invoice extraction failed: %s", exc)
-                st.error(f"Invoice extraction failed: {exc}")
+    if st.session_state.get("image_bytes"):
+        st.markdown("### Passo 3. Revisar foto")
+        st.toggle("Exibir pré-visualização", key="show_preview")
+        render_image_preview()
 
-    with button_column_2:
-        if st.button("2. Qualify extracted JSON", use_container_width=True):
-            try:
-                with st.spinner("Running qualification service..."):
-                    run_qualification()
-            except Exception as exc:
-                logging.exception("Invoice qualification failed: %s", exc)
-                st.error(f"Invoice qualification failed: {exc}")
+    if st.session_state.get("qualified_data") is not None:
+        st.markdown("### Passo 4. Resultado qualificado")
+        render_qualified_result()
 
-    with button_column_3:
-        if st.button("Reset", use_container_width=True):
+        st.divider()
+        st.markdown("### Passo 5. Recomeçar")
+        if st.button("Recomeçar", use_container_width=True):
             reset_workflow()
-
-    st.divider()
-    render_results()
 
 
 if __name__ == "__main__":

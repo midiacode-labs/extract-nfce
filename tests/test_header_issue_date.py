@@ -22,8 +22,7 @@ class HeaderIssueDateTests(unittest.TestCase):
 
         data = parse_expense_data(response)
 
-        self.assertEqual(data["header"].get("date"), "12/04/2026")
-        self.assertEqual(data["header"].get("issue_date"), "12/04/2026")
+        self.assertEqual(data["identification"].get("issue_date"), "12/04/2026")
 
     def test_extracts_invoice_issue_date_from_generic_ocr_fields(self):
         response = {
@@ -49,8 +48,7 @@ class HeaderIssueDateTests(unittest.TestCase):
 
         data = parse_expense_data(response)
 
-        self.assertEqual(data["header"].get("date"), "12/04/2026")
-        self.assertEqual(data["header"].get("issue_date"), "12/04/2026")
+        self.assertEqual(data["identification"].get("issue_date"), "12/04/2026")
 
 
 if __name__ == "__main__":
