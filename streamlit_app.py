@@ -9,6 +9,7 @@ import uuid
 from typing import Any, Dict
 
 import streamlit as st
+import streamlit.components.v1 as components
 
 from services.invoice_qualification_service import InvoiceQualificationService
 from services.openai_invoice_service import OpenAIInvoiceExtractionService
@@ -36,6 +37,7 @@ STATE_DEFAULTS: Dict[str, Any] = {
     "workflow_usage": None,
     "last_processed_method": None,
     "widget_nonce": 0,
+    "camera_zoom_level": 1.8,
 }
 
 EXTRACTION_METHOD_LABELS = {
@@ -292,6 +294,132 @@ def render_image_preview() -> None:
     st.markdown(image_html, unsafe_allow_html=True)
 
 
+def render_camera_capture_assist() -> None:
+    st.caption(
+            "Ajuste o zoom e use o guia A4 para enquadrar sem aproximar demais a câmera. "
+            "O zoom depende do suporte do navegador/dispositivo."
+    )
+    st.slider(
+            "Zoom da câmera (quando suportado)",
+            min_value=1.0,
+            max_value=3.0,
+            value=float(st.session_state.get("camera_zoom_level", 1.8)),
+            step=0.1,
+            key="camera_zoom_level",
+            help="Em geral, valores entre 1.5x e 2.0x ajudam no foco para papel A4.",
+    )
+
+    st.markdown(
+            "- Afaste um pouco o celular até o papel ficar nítido.\n"
+            "- Centralize a folha dentro do retângulo A4.\n"
+            "- Evite sombras sobre o documento."
+    )
+
+    target_zoom = float(st.session_state.get("camera_zoom_level", 1.8))
+    assist_script = f"""
+    <script>
+        (() => {{
+            const targetZoom = {target_zoom:.1f};
+            const A4_RATIO = 1.0 / 1.4142;
+
+            const clamp = (value, min, max) => Math.max(min, Math.min(max, value));
+
+            const ensureGuide = (video) => {{
+                const container = video.parentElement;
+                if (!container) return;
+                if (container.querySelector('.nfce-a4-guide')) return;
+
+                container.style.position = 'relative';
+
+                const guide = parent.document.createElement('div');
+                guide.className = 'nfce-a4-guide';
+                guide.style.position = 'absolute';
+                guide.style.left = '50%';
+                guide.style.top = '50%';
+                guide.style.transform = 'translate(-50%, -50%)';
+                guide.style.width = '75%';
+                guide.style.maxWidth = '420px';
+                guide.style.aspectRatio = `${{A4_RATIO}}`;
+                guide.style.border = '2px dashed rgba(56, 189, 248, 0.95)';
+                guide.style.borderRadius = '12px';
+                guide.style.boxShadow = '0 0 0 9999px rgba(15, 23, 42, 0.22)';
+                guide.style.pointerEvents = 'none';
+                guide.style.zIndex = '30';
+
+                const label = parent.document.createElement('div');
+                label.textContent = 'Guia A4';
+                label.style.position = 'absolute';
+                label.style.top = '-28px';
+                label.style.left = '0';
+                label.style.padding = '4px 8px';
+                label.style.borderRadius = '999px';
+                label.style.background = 'rgba(15, 23, 42, 0.88)';
+                label.style.color = '#f8fafc';
+                label.style.font = (
+                    '600 12px/1.2 -apple-system, BlinkMacSystemFont, Segoe UI, sans-serif'
+                );
+                guide.appendChild(label);
+
+                container.appendChild(guide);
+            }};
+
+            const applyTrackTuning = async (track) => {{
+                if (!track || !track.getCapabilities || !track.applyConstraints) return;
+
+                const capabilities = track.getCapabilities();
+                const advanced = {{}};
+
+                if (capabilities.zoom) {{
+                    const min = capabilities.zoom.min ?? 1.0;
+                    const max = capabilities.zoom.max ?? targetZoom;
+                    advanced.zoom = clamp(targetZoom, min, max);
+                }}
+
+                if (Array.isArray(capabilities.focusMode)) {{
+                    if (capabilities.focusMode.includes('continuous')) {{
+                        advanced.focusMode = 'continuous';
+                    }} else if (capabilities.focusMode.includes('single-shot')) {{
+                        advanced.focusMode = 'single-shot';
+                    }}
+                }}
+
+                const constraints = {{
+                    width: {{ ideal: 4096 }},
+                    height: {{ ideal: 2160 }},
+                }};
+
+                if (Object.keys(advanced).length) {{
+                    constraints.advanced = [advanced];
+                }}
+
+                try {{
+                    await track.applyConstraints(constraints);
+                }} catch (_error) {{
+                    // Silently ignore unsupported constraints.
+                }}
+            }};
+
+            const scanAndEnhance = () => {{
+                const videos = parent.document.querySelectorAll('video');
+                videos.forEach((video) => {{
+                    ensureGuide(video);
+                    const stream = video.srcObject;
+                    if (!stream || !stream.getVideoTracks) return;
+                    const [track] = stream.getVideoTracks();
+                    if (!track) return;
+                    applyTrackTuning(track);
+                }});
+            }};
+
+            scanAndEnhance();
+            const timerId = setInterval(scanAndEnhance, 1000);
+            window.addEventListener('beforeunload', () => clearInterval(timerId));
+        }})();
+    </script>
+    """
+    components.html(assist_script, height=0)
+
+
 def format_label(value: str) -> str:
     """Converts snake_case field names into readable labels."""
     return value.replace("_", " ").strip().title()
@@ -508,6 +636,7 @@ def main() -> None:
             key=f"file_uploader_{nonce}",
         )
     else:
+        render_camera_capture_assist()
         selected_file = st.camera_input(
             "Tire uma foto da nota fiscal",
             key=f"camera_input_{nonce}",
